@@ -1,0 +1,13 @@
+# Node
+node_modules
+dist
+
+# Env/Config
+config.yaml
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+*.iml
