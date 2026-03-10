@@ -4,3 +4,12 @@ server:
 
 logger:
   level: "info"
+
+database:
+  path: "./data/claw-dupe.db"
+
+telegram:
+  botToken: ""
+  webhookPath: "/telegram/webhook"
+  webhookSecret: "my-secret-123"
+  requestTimeoutMs: 5000

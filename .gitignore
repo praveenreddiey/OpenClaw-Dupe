@@ -4,6 +4,7 @@ dist
 
 # Env/Config
 config.yaml
+.env
 
 # OS/Editor
 .DS_Store

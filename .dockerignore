@@ -1,0 +1,11 @@
+# Exclude host artifacts that break container builds
+node_modules
+dist
+data
+.git
+.gitignore
+.env
+.env.*
+npm-debug.log
+Dockerfile
+docker-compose.yml

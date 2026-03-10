@@ -2,23 +2,26 @@
   "name": "claw-dupe",
   "version": "1.0.0",
   "description": "",
-  "main": "dist/server.js",
+  "main": "dist/src/server.js",
   "scripts": {
-    "dev": "tsx src/server.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "npm run build && node dist/src/server.js",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "test": "npm run build && node --test dist/tests/*.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "better-sqlite3": "^12.6.2",
     "fastify": "^5.8.2",
     "pino": "^10.3.1",
     "yaml": "^2.8.2"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.3.5",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
