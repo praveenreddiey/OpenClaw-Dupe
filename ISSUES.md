@@ -48,3 +48,9 @@ This file records post-milestone code review findings and suggested fixes.
   - Store only the fields needed for normal operations in `messages`.
   - Move raw payload capture into a separate audit table with retention rules.
   - Truncate or compress large payloads if full payload storage is required.
+
+## 2026-03-10 (IST) - Week 1 completion review
+
+- Reviewed codebase after milestone sign-off; no new commits since 2026-03-08 reliability follow-up.
+- Findings: no additional issues identified; existing open items (#3–#5 from 2026-03-08 review) remain and should be addressed next.
+- Tests: not re-run (no code changes).

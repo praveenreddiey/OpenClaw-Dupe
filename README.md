@@ -26,7 +26,8 @@ Notes
 - `npm start` now validates the Telegram runtime config before boot and fails fast if `telegram.botToken` is missing.
 - Keep `config.yaml` out of git.
 
-- register the webhook after every deployment(role of developer)
+- register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
+
   $token = ""
     $webhookUrl = "/telegram/webhook"
     $secret = "my-secret-123"   # pick anything, but keep it in config too
@@ -36,6 +37,11 @@ Notes
   drop_pending_updates = $true
   allowed_updates = @("message","edited_message")
   } | ConvertTo-Json)
+
+--docker build
+
+docker compose --env-file .env down
+docker compose --env-file .env up --build
 
 Roadmap
 
