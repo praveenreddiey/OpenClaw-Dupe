@@ -33,8 +33,8 @@ Notes
 
 - register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
 
-  $token = "8556974125:AAH-Ogtt2Sy0c_y2MVcXG9wE2LSX_4r6psI"
-    $webhookUrl = "https://migration-separation-acrylic-philadelphia.trycloudflare.com/telegram/webhook"
+  $token = ""
+    $webhookUrl = "/telegram/webhook"
     $secret = "my-secret-123"   # pick anything, but keep it in config too
     Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -ContentType "application/json" -Body (@{
   url = $webhookUrl
