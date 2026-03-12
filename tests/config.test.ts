@@ -19,6 +19,8 @@ function createValidConfig(): AppConfig {
       webhookPath: "/telegram/webhook",
       webhookSecret: "",
       requestTimeoutMs: 5000,
+      rateLimitWindowMs: 60000,
+      rateLimitMaxRequests: 10,
     },
   };
 }
@@ -44,5 +46,25 @@ test("validateRuntimeConfig rejects an invalid Telegram timeout", () => {
   assert.throws(
     () => validateRuntimeConfig(config),
     /telegram\.requestTimeoutMs must be a positive integer/,
+  );
+});
+
+test("validateRuntimeConfig rejects an invalid Telegram rate limit window", () => {
+  const config = createValidConfig();
+  config.telegram.rateLimitWindowMs = 0;
+
+  assert.throws(
+    () => validateRuntimeConfig(config),
+    /telegram\.rateLimitWindowMs must be a positive integer/,
+  );
+});
+
+test("validateRuntimeConfig rejects an invalid Telegram rate limit max requests", () => {
+  const config = createValidConfig();
+  config.telegram.rateLimitMaxRequests = 0;
+
+  assert.throws(
+    () => validateRuntimeConfig(config),
+    /telegram\.rateLimitMaxRequests must be a positive integer/,
   );
 });

@@ -18,6 +18,8 @@ export type AppConfig = {
     webhookPath: string;
     webhookSecret: string;
     requestTimeoutMs: number;
+    rateLimitWindowMs: number;
+    rateLimitMaxRequests: number;
   };
 };
 
@@ -37,6 +39,8 @@ const defaults: AppConfig = {
     webhookPath: "/telegram/webhook",
     webhookSecret: "",
     requestTimeoutMs: 5000,
+    rateLimitWindowMs: 60000,
+    rateLimitMaxRequests: 10,
   },
 };
 
@@ -67,6 +71,20 @@ export function validateRuntimeConfig(config: AppConfig): void {
 
   if (!Number.isInteger(config.telegram.requestTimeoutMs) || config.telegram.requestTimeoutMs <= 0) {
     errors.push("telegram.requestTimeoutMs must be a positive integer");
+  }
+
+  if (
+    !Number.isInteger(config.telegram.rateLimitWindowMs) ||
+    config.telegram.rateLimitWindowMs <= 0
+  ) {
+    errors.push("telegram.rateLimitWindowMs must be a positive integer");
+  }
+
+  if (
+    !Number.isInteger(config.telegram.rateLimitMaxRequests) ||
+    config.telegram.rateLimitMaxRequests <= 0
+  ) {
+    errors.push("telegram.rateLimitMaxRequests must be a positive integer");
   }
 
   if (errors.length > 0) {
@@ -111,6 +129,14 @@ export async function loadConfig(
           parsed.telegram?.requestTimeoutMs,
           defaults.telegram.requestTimeoutMs,
         ),
+        rateLimitWindowMs: readPositiveInteger(
+          parsed.telegram?.rateLimitWindowMs,
+          defaults.telegram.rateLimitWindowMs,
+        ),
+        rateLimitMaxRequests: readPositiveInteger(
+          parsed.telegram?.rateLimitMaxRequests,
+          defaults.telegram.rateLimitMaxRequests,
+        ),
       },
     };
   } catch (error) {
@@ -132,6 +158,8 @@ export async function loadConfig(
           defaults.telegram.webhookSecret,
         ),
         requestTimeoutMs: defaults.telegram.requestTimeoutMs,
+        rateLimitWindowMs: defaults.telegram.rateLimitWindowMs,
+        rateLimitMaxRequests: defaults.telegram.rateLimitMaxRequests,
       },
     };
   }

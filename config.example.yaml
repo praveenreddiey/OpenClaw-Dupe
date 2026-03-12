@@ -13,3 +13,5 @@ telegram:
   webhookPath: "/telegram/webhook"
   webhookSecret: "my-secret-123"
   requestTimeoutMs: 5000
+  rateLimitWindowMs: 60000
+  rateLimitMaxRequests: 10

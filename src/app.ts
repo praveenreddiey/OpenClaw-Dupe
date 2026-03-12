@@ -1,14 +1,25 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import type { AppConfig } from "./config.js";
-import { createMessageStore, type MessageStore } from "./db.js";
+import {
+  createMessageStore,
+  type MessageRecord,
+  type MessageStore,
+  type MessageUpdate,
+} from "./db.js";
 
 type TelegramChat = {
+  id: number | string;
+};
+
+type TelegramUser = {
   id: number | string;
 };
 
 type TelegramMessage = {
   message_id: number;
   chat: TelegramChat;
+  from?: TelegramUser;
+  date?: number;
   text?: string;
 };
 
@@ -57,6 +68,58 @@ export class TelegramDeliveryError extends Error {
   }
 }
 
+class MessagePersistenceError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MessagePersistenceError";
+    this.statusCode = 500;
+  }
+}
+
+type RateLimitCheckResult = {
+  allowed: boolean;
+  retryAfterSeconds: number;
+};
+
+type RateLimiter = {
+  check(key: string): RateLimitCheckResult;
+};
+
+function createRateLimiter(windowMs: number, maxRequests: number): RateLimiter {
+  const hitsByKey = new Map<string, number[]>();
+
+  return {
+    check(key) {
+      const now = Date.now();
+      const windowStart = now - windowMs;
+      const activeHits = (hitsByKey.get(key) ?? []).filter(
+        (timestamp) => timestamp > windowStart,
+      );
+
+      if (activeHits.length >= maxRequests) {
+        hitsByKey.set(key, activeHits);
+        const oldestHit = activeHits[0] ?? now;
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((windowMs - (now - oldestHit)) / 1000),
+          ),
+        };
+      }
+
+      activeHits.push(now);
+      hitsByKey.set(key, activeHits);
+      return {
+        allowed: true,
+        retryAfterSeconds: 0,
+      };
+    },
+  };
+}
+
 function getTextMessage(update: TelegramUpdate): TextTelegramMessage | null {
   const candidate = update.message ?? update.edited_message;
   if (!candidate?.text) {
@@ -81,6 +144,93 @@ function parseTelegramErrorDescription(
     return payload.description ?? statusText;
   } catch {
     return statusText;
+  }
+}
+
+function sanitizeTelegramText(text: string): string {
+  let normalized = text;
+  try {
+    normalized = text.normalize("NFKC");
+  } catch {
+    normalized = text;
+  }
+
+  return normalized
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+}
+
+function sanitizeTelegramUpdateForStorage(update: TelegramUpdate): TelegramUpdate {
+  const sanitizeMessage = (
+    message: TelegramMessage | undefined,
+  ): TelegramMessage | undefined => {
+    if (!message) {
+      return undefined;
+    }
+
+    return {
+      ...message,
+      text: typeof message.text === "string"
+        ? sanitizeTelegramText(message.text)
+        : message.text,
+    };
+  };
+
+  return {
+    ...update,
+    message: sanitizeMessage(update.message),
+    edited_message: sanitizeMessage(update.edited_message),
+  };
+}
+
+function buildMessageTimestamp(unixSeconds?: number): string {
+  if (typeof unixSeconds === "number" && Number.isFinite(unixSeconds) && unixSeconds > 0) {
+    return new Date(unixSeconds * 1000).toISOString();
+  }
+
+  return new Date().toISOString();
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function serializeErrorPayload(error: unknown): string {
+  return JSON.stringify({
+    name: error instanceof Error ? error.name : "Error",
+    message: getErrorMessage(error),
+  });
+}
+
+function insertMessageOrThrow(
+  request: FastifyRequest,
+  messageStore: MessageStore,
+  message: Parameters<MessageStore["insertMessage"]>[0],
+  context: Record<string, unknown>,
+): MessageRecord {
+  try {
+    return messageStore.insertMessage(message);
+  } catch (error) {
+    request.log.error({ err: error, ...context }, "failed to persist message");
+    throw new MessagePersistenceError("Failed to persist message", {
+      cause: error,
+    });
+  }
+}
+
+function updateMessageSafely(
+  request: FastifyRequest,
+  messageStore: MessageStore,
+  id: number,
+  update: MessageUpdate,
+  context: Record<string, unknown>,
+): MessageRecord | null {
+  try {
+    return messageStore.updateMessage(id, update);
+  } catch (error) {
+    request.log.error({ err: error, messageId: id, ...context }, "failed to update message");
+    return null;
   }
 }
 
@@ -162,6 +312,10 @@ export function buildApp(
       config.telegram.botToken,
       config.telegram.requestTimeoutMs,
     );
+  const rateLimiter = createRateLimiter(
+    config.telegram.rateLimitWindowMs,
+    config.telegram.rateLimitMaxRequests,
+  );
 
   const app = Fastify({
     logger: {
@@ -170,6 +324,12 @@ export function buildApp(
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof MessagePersistenceError) {
+      request.log.error({ err: error }, "message persistence failed");
+      reply.status(error.statusCode).send({ error: error.message });
+      return;
+    }
+
     if (error instanceof TelegramDeliveryError) {
       request.log.warn(
         { err: error, statusCode: error.statusCode },
@@ -201,8 +361,11 @@ export function buildApp(
     async (request, reply) => {
       const configuredSecret = config.telegram.webhookSecret;
       const headerSecret = request.headers["x-telegram-bot-api-secret-token"];
+      const providedSecret = Array.isArray(headerSecret)
+        ? headerSecret[0]
+        : headerSecret;
 
-      if (configuredSecret && headerSecret !== configuredSecret) {
+      if (configuredSecret && providedSecret !== configuredSecret) {
         request.log.warn("rejected telegram webhook with invalid secret");
         reply.status(401).send({ error: "Invalid Telegram webhook secret" });
         return;
@@ -219,46 +382,196 @@ export function buildApp(
       }
 
       const chatId = String(textMessage.chat.id);
-      const incoming = messageStore.insertMessage({
-        chatId,
-        direction: "incoming",
-        text: textMessage.text,
-        telegramMessageId: textMessage.message_id,
-        payloadJson: JSON.stringify(request.body),
-      });
-
-      const replyText = `Echo: ${textMessage.text}`;
-      const telegramResponse = await telegramClient.sendMessage({
-        chatId,
-        text: replyText,
-        replyToMessageId: textMessage.message_id,
-      });
-
-      const outgoing = messageStore.insertMessage({
-        chatId,
-        direction: "outgoing",
-        text: replyText,
-        telegramMessageId: telegramResponse.messageId,
-        payloadJson: telegramResponse.payloadJson,
-      });
+      const userId = textMessage.from ? String(textMessage.from.id) : null;
+      const incomingTimestamp = buildMessageTimestamp(textMessage.date);
+      const sanitizedText = sanitizeTelegramText(textMessage.text);
 
       request.log.info(
         {
           updateId: request.body?.update_id ?? null,
           chatId,
-          incomingId: incoming.id,
-          outgoingId: outgoing.id,
-          delivered: telegramResponse.delivered,
+          userId,
+          telegramMessageId: textMessage.message_id,
+          messageTimestamp: incomingTimestamp,
+          status: "received",
+          textLength: sanitizedText.length,
         },
-        "processed telegram echo",
+        "received telegram message",
       );
 
-      reply.send({
-        ok: true,
-        echoed: true,
-        delivered: telegramResponse.delivered,
-        replyText,
-      });
+      const rateLimit = rateLimiter.check(`chat:${chatId}`);
+      if (!rateLimit.allowed) {
+        request.log.warn(
+          {
+            updateId: request.body?.update_id ?? null,
+            chatId,
+            userId,
+            retryAfterSeconds: rateLimit.retryAfterSeconds,
+          },
+          "rate limited telegram message",
+        );
+        reply.header("retry-after", String(rateLimit.retryAfterSeconds));
+        reply.status(429).send({ error: "Rate limit exceeded" });
+        return;
+      }
+
+      const incoming = insertMessageOrThrow(
+        request,
+        messageStore,
+        {
+          chatId,
+          userId,
+          direction: "incoming",
+          status: "received",
+          text: sanitizedText,
+          telegramMessageId: textMessage.message_id,
+          messageTimestamp: incomingTimestamp,
+          payloadJson: JSON.stringify(sanitizeTelegramUpdateForStorage(request.body)),
+        },
+        {
+          chatId,
+          userId,
+          direction: "incoming",
+          telegramMessageId: textMessage.message_id,
+        },
+      );
+
+      const replyText = `Echo: ${sanitizedText}`;
+      let outgoing: MessageRecord;
+
+      try {
+        outgoing = insertMessageOrThrow(
+          request,
+          messageStore,
+          {
+            chatId,
+            userId: null,
+            direction: "outgoing",
+            status: "received",
+            text: replyText,
+            messageTimestamp: buildMessageTimestamp(),
+            payloadJson: null,
+          },
+          {
+            chatId,
+            direction: "outgoing",
+            status: "received",
+          },
+        );
+      } catch (error) {
+        updateMessageSafely(
+          request,
+          messageStore,
+          incoming.id,
+          { status: "failed" },
+          {
+            chatId,
+            userId,
+            direction: "incoming",
+            reason: "outgoing message placeholder insert failed",
+          },
+        );
+        throw error;
+      }
+
+      try {
+        const telegramResponse = await telegramClient.sendMessage({
+          chatId,
+          text: replyText,
+          replyToMessageId: textMessage.message_id,
+        });
+
+        const responseTimestamp = buildMessageTimestamp();
+        const processedIncoming = updateMessageSafely(
+          request,
+          messageStore,
+          incoming.id,
+          { status: "processed" },
+          {
+            chatId,
+            userId,
+            direction: "incoming",
+          },
+        );
+        const processedOutgoing = updateMessageSafely(
+          request,
+          messageStore,
+          outgoing.id,
+          {
+            status: "processed",
+            telegramMessageId: telegramResponse.messageId,
+            messageTimestamp: responseTimestamp,
+            payloadJson: telegramResponse.payloadJson,
+          },
+          {
+            chatId,
+            direction: "outgoing",
+          },
+        );
+
+        request.log.info(
+          {
+            updateId: request.body?.update_id ?? null,
+            chatId,
+            userId,
+            incomingId: processedIncoming?.id ?? incoming.id,
+            outgoingId: processedOutgoing?.id ?? outgoing.id,
+            telegramMessageId: telegramResponse.messageId,
+            delivered: telegramResponse.delivered,
+            status: "processed",
+            textLength: replyText.length,
+          },
+          "sent telegram response",
+        );
+
+        reply.send({
+          ok: true,
+          echoed: true,
+          delivered: telegramResponse.delivered,
+          replyText,
+        });
+      } catch (error) {
+        updateMessageSafely(
+          request,
+          messageStore,
+          incoming.id,
+          { status: "failed" },
+          {
+            chatId,
+            userId,
+            direction: "incoming",
+          },
+        );
+        updateMessageSafely(
+          request,
+          messageStore,
+          outgoing.id,
+          {
+            status: "failed",
+            payloadJson: serializeErrorPayload(error),
+            messageTimestamp: buildMessageTimestamp(),
+          },
+          {
+            chatId,
+            direction: "outgoing",
+          },
+        );
+
+        request.log.warn(
+          {
+            updateId: request.body?.update_id ?? null,
+            chatId,
+            userId,
+            incomingId: incoming.id,
+            outgoingId: outgoing.id,
+            status: "failed",
+            errorMessage: getErrorMessage(error),
+          },
+          "telegram response failed",
+        );
+
+        throw error;
+      }
     },
   );
 
