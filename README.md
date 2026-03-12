@@ -27,12 +27,14 @@ Notes
 - `npm start` now validates the Telegram runtime config before boot and fails fast if `telegram.botToken` is missing.
 - Incoming and outgoing Telegram messages are logged with metadata only, stored with `chat_id`, `user_id`, `message_id`, timestamps, and a status of `received`, `processed`, or `failed`.
 - SQLite adds indexes for chat, user, message, and timestamp lookups to keep message history queries fast.
+- SQLite prefers WAL mode, but automatically falls back to `DELETE` journal mode on Docker/Desktop bind mounts or synced folders that cannot open WAL shared-memory files.
+- Inbound webhook handling now flows through a transport-neutral `UnifiedMessage` shape, with Telegram-specific parsing and delivery isolated in `TelegramAdapter` so future adapters can plug in more easily.
 - Keep `config.yaml` out of git.
 
 - register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
 
-  $token = ""
-    $webhookUrl = "/telegram/webhook"
+  $token = "8556974125:AAH-Ogtt2Sy0c_y2MVcXG9wE2LSX_4r6psI"
+    $webhookUrl = "https://migration-separation-acrylic-philadelphia.trycloudflare.com/telegram/webhook"
     $secret = "my-secret-123"   # pick anything, but keep it in config too
     Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -ContentType "application/json" -Body (@{
   url = $webhookUrl

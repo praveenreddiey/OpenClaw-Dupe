@@ -6,67 +6,27 @@ import {
   type MessageStore,
   type MessageUpdate,
 } from "./db.js";
+import type { MessageAdapter } from "./messages.js";
+import {
+  createTelegramClient,
+  TelegramAdapter,
+  TelegramDeliveryError,
+  type TelegramClient,
+} from "./telegram-adapter.js";
 
-type TelegramChat = {
-  id: number | string;
+export {
+  createTelegramClient,
+  TelegramAdapter,
+  TelegramDeliveryError,
+  type TelegramClient,
 };
-
-type TelegramUser = {
-  id: number | string;
-};
-
-type TelegramMessage = {
-  message_id: number;
-  chat: TelegramChat;
-  from?: TelegramUser;
-  date?: number;
-  text?: string;
-};
-
-type TelegramUpdate = {
-  update_id?: number;
-  message?: TelegramMessage;
-  edited_message?: TelegramMessage;
-};
-
-export type TelegramSendInput = {
-  chatId: string;
-  text: string;
-  replyToMessageId?: number;
-};
-
-export type TelegramSendResult = {
-  delivered: boolean;
-  messageId: number | null;
-  payloadJson: string | null;
-};
-
-export type TelegramClient = {
-  sendMessage(input: TelegramSendInput): Promise<TelegramSendResult>;
-};
+export type { MessageAdapter } from "./messages.js";
 
 type BuildAppOptions = {
   messageStore?: MessageStore;
+  messageAdapter?: MessageAdapter;
   telegramClient?: TelegramClient;
 };
-
-type TextTelegramMessage = TelegramMessage & {
-  text: string;
-};
-
-export class TelegramDeliveryError extends Error {
-  readonly statusCode: number;
-
-  constructor(
-    message: string,
-    statusCode = 502,
-    options?: { cause?: unknown },
-  ) {
-    super(message, options);
-    this.name = "TelegramDeliveryError";
-    this.statusCode = statusCode;
-  }
-}
 
 class MessagePersistenceError extends Error {
   readonly statusCode: number;
@@ -120,76 +80,17 @@ function createRateLimiter(windowMs: number, maxRequests: number): RateLimiter {
   };
 }
 
-function getTextMessage(update: TelegramUpdate): TextTelegramMessage | null {
-  const candidate = update.message ?? update.edited_message;
-  if (!candidate?.text) {
+function currentTimestamp(): string {
+  return new Date().toISOString();
+}
+
+function parseStoredMessageId(messageId: string | null): number | null {
+  if (!messageId) {
     return null;
   }
 
-  return {
-    ...candidate,
-    text: candidate.text,
-  };
-}
-
-function parseTelegramErrorDescription(
-  payloadText: string,
-  statusText: string,
-): string {
-  try {
-    const payload = JSON.parse(payloadText) as {
-      description?: string;
-    };
-
-    return payload.description ?? statusText;
-  } catch {
-    return statusText;
-  }
-}
-
-function sanitizeTelegramText(text: string): string {
-  let normalized = text;
-  try {
-    normalized = text.normalize("NFKC");
-  } catch {
-    normalized = text;
-  }
-
-  return normalized
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
-}
-
-function sanitizeTelegramUpdateForStorage(update: TelegramUpdate): TelegramUpdate {
-  const sanitizeMessage = (
-    message: TelegramMessage | undefined,
-  ): TelegramMessage | undefined => {
-    if (!message) {
-      return undefined;
-    }
-
-    return {
-      ...message,
-      text: typeof message.text === "string"
-        ? sanitizeTelegramText(message.text)
-        : message.text,
-    };
-  };
-
-  return {
-    ...update,
-    message: sanitizeMessage(update.message),
-    edited_message: sanitizeMessage(update.edited_message),
-  };
-}
-
-function buildMessageTimestamp(unixSeconds?: number): string {
-  if (typeof unixSeconds === "number" && Number.isFinite(unixSeconds) && unixSeconds > 0) {
-    return new Date(unixSeconds * 1000).toISOString();
-  }
-
-  return new Date().toISOString();
+  const parsed = Number(messageId);
+  return Number.isInteger(parsed) ? parsed : null;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -229,74 +130,12 @@ function updateMessageSafely(
   try {
     return messageStore.updateMessage(id, update);
   } catch (error) {
-    request.log.error({ err: error, messageId: id, ...context }, "failed to update message");
+    request.log.error(
+      { err: error, messageId: id, ...context },
+      "failed to update message",
+    );
     return null;
   }
-}
-
-export function createTelegramClient(
-  botToken: string,
-  requestTimeoutMs: number,
-  fetchImpl: typeof fetch = fetch,
-): TelegramClient {
-  return {
-    async sendMessage(input) {
-      try {
-        const response = await fetchImpl(
-          `https://api.telegram.org/bot${botToken}/sendMessage`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              chat_id: input.chatId,
-              text: input.text,
-              reply_to_message_id: input.replyToMessageId,
-            }),
-            signal: AbortSignal.timeout(requestTimeoutMs),
-          },
-        );
-
-        const payloadText = await response.text();
-        const payload = payloadText
-          ? (JSON.parse(payloadText) as {
-              ok?: boolean;
-              result?: { message_id?: number };
-              description?: string;
-            })
-          : {};
-
-        if (!response.ok || !payload.ok) {
-          throw new TelegramDeliveryError(
-            `Telegram sendMessage failed: ${parseTelegramErrorDescription(payloadText, response.statusText)}`,
-          );
-        }
-
-        return {
-          delivered: true,
-          messageId: payload.result?.message_id ?? null,
-          payloadJson: payloadText || null,
-        };
-      } catch (error) {
-        if (error instanceof TelegramDeliveryError) {
-          throw error;
-        }
-
-        if (error instanceof Error && error.name === "TimeoutError") {
-          throw new TelegramDeliveryError(
-            `Telegram sendMessage timed out after ${requestTimeoutMs}ms`,
-            504,
-            { cause: error },
-          );
-        }
-
-        throw new TelegramDeliveryError("Telegram sendMessage failed", 502, {
-          cause: error,
-        });
-      }
-    },
-  };
 }
 
 export function buildApp(
@@ -306,11 +145,14 @@ export function buildApp(
   const ownsStore = !options.messageStore;
   const messageStore =
     options.messageStore ?? createMessageStore(config.database.path);
-  const telegramClient =
-    options.telegramClient ??
-    createTelegramClient(
-      config.telegram.botToken,
-      config.telegram.requestTimeoutMs,
+  const messageAdapter =
+    options.messageAdapter ??
+    new TelegramAdapter(
+      options.telegramClient ??
+        createTelegramClient(
+          config.telegram.botToken,
+          config.telegram.requestTimeoutMs,
+        ),
     );
   const rateLimiter = createRateLimiter(
     config.telegram.rateLimitWindowMs,
@@ -352,63 +194,58 @@ export function buildApp(
   app.get("/health", async () => ({
     status: "ok",
     uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
+    timestamp: currentTimestamp(),
     telegramWebhookPath: config.telegram.webhookPath,
   }));
 
-  app.post<{ Body: TelegramUpdate }>(
+  app.post(
     config.telegram.webhookPath,
     async (request, reply) => {
-      const configuredSecret = config.telegram.webhookSecret;
-      const headerSecret = request.headers["x-telegram-bot-api-secret-token"];
-      const providedSecret = Array.isArray(headerSecret)
-        ? headerSecret[0]
-        : headerSecret;
-
-      if (configuredSecret && providedSecret !== configuredSecret) {
-        request.log.warn("rejected telegram webhook with invalid secret");
+      const headers = request.headers as Record<
+        string,
+        string | string[] | undefined
+      >;
+      if (!messageAdapter.verifyRequest(headers, config.telegram.webhookSecret)) {
+        request.log.warn({ adapter: messageAdapter.name }, "rejected webhook with invalid secret");
         reply.status(401).send({ error: "Invalid Telegram webhook secret" });
         return;
       }
 
-      const textMessage = getTextMessage(request.body);
-      if (!textMessage) {
+      const incomingMessage = messageAdapter.parseIncoming(request.body);
+      if (!incomingMessage) {
         request.log.info(
-          { updateId: request.body?.update_id ?? null },
-          "ignored telegram update without text",
+          { adapter: messageAdapter.name },
+          "ignored incoming update without a supported text payload",
         );
         reply.send({ ok: true, ignored: true });
         return;
       }
 
-      const chatId = String(textMessage.chat.id);
-      const userId = textMessage.from ? String(textMessage.from.id) : null;
-      const incomingTimestamp = buildMessageTimestamp(textMessage.date);
-      const sanitizedText = sanitizeTelegramText(textMessage.text);
-
       request.log.info(
         {
-          updateId: request.body?.update_id ?? null,
-          chatId,
-          userId,
-          telegramMessageId: textMessage.message_id,
-          messageTimestamp: incomingTimestamp,
+          adapter: incomingMessage.platform,
+          eventId: incomingMessage.eventId,
+          chatId: incomingMessage.chatId,
+          userId: incomingMessage.userId,
+          externalMessageId: incomingMessage.messageId,
+          messageTimestamp: incomingMessage.timestamp,
           status: "received",
-          textLength: sanitizedText.length,
+          textLength: incomingMessage.text.length,
         },
-        "received telegram message",
+        "received incoming message",
       );
 
-      const rateLimit = rateLimiter.check(`chat:${chatId}`);
+      const rateLimit = rateLimiter.check(incomingMessage.rateLimitKey);
       if (!rateLimit.allowed) {
         request.log.warn(
           {
-            updateId: request.body?.update_id ?? null,
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            eventId: incomingMessage.eventId,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             retryAfterSeconds: rateLimit.retryAfterSeconds,
           },
-          "rate limited telegram message",
+          "rate limited incoming message",
         );
         reply.header("retry-after", String(rateLimit.retryAfterSeconds));
         reply.status(429).send({ error: "Rate limit exceeded" });
@@ -419,24 +256,25 @@ export function buildApp(
         request,
         messageStore,
         {
-          chatId,
-          userId,
+          chatId: incomingMessage.chatId,
+          userId: incomingMessage.userId,
           direction: "incoming",
           status: "received",
-          text: sanitizedText,
-          telegramMessageId: textMessage.message_id,
-          messageTimestamp: incomingTimestamp,
-          payloadJson: JSON.stringify(sanitizeTelegramUpdateForStorage(request.body)),
+          text: incomingMessage.text,
+          telegramMessageId: parseStoredMessageId(incomingMessage.messageId),
+          messageTimestamp: incomingMessage.timestamp,
+          payloadJson: incomingMessage.payloadJson,
         },
         {
-          chatId,
-          userId,
+          adapter: incomingMessage.platform,
+          chatId: incomingMessage.chatId,
+          userId: incomingMessage.userId,
           direction: "incoming",
-          telegramMessageId: textMessage.message_id,
+          externalMessageId: incomingMessage.messageId,
         },
       );
 
-      const replyText = `Echo: ${sanitizedText}`;
+      const replyText = `Echo: ${incomingMessage.text}`;
       let outgoing: MessageRecord;
 
       try {
@@ -444,16 +282,17 @@ export function buildApp(
           request,
           messageStore,
           {
-            chatId,
+            chatId: incomingMessage.chatId,
             userId: null,
             direction: "outgoing",
             status: "received",
             text: replyText,
-            messageTimestamp: buildMessageTimestamp(),
+            messageTimestamp: currentTimestamp(),
             payloadJson: null,
           },
           {
-            chatId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
             direction: "outgoing",
             status: "received",
           },
@@ -465,8 +304,9 @@ export function buildApp(
           incoming.id,
           { status: "failed" },
           {
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             direction: "incoming",
             reason: "outgoing message placeholder insert failed",
           },
@@ -475,21 +315,21 @@ export function buildApp(
       }
 
       try {
-        const telegramResponse = await telegramClient.sendMessage({
-          chatId,
+        const delivery = await messageAdapter.sendMessage({
+          chatId: incomingMessage.chatId,
           text: replyText,
-          replyToMessageId: textMessage.message_id,
+          replyToMessageId: incomingMessage.replyToMessageId,
         });
 
-        const responseTimestamp = buildMessageTimestamp();
         const processedIncoming = updateMessageSafely(
           request,
           messageStore,
           incoming.id,
           { status: "processed" },
           {
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             direction: "incoming",
           },
         );
@@ -499,35 +339,37 @@ export function buildApp(
           outgoing.id,
           {
             status: "processed",
-            telegramMessageId: telegramResponse.messageId,
-            messageTimestamp: responseTimestamp,
-            payloadJson: telegramResponse.payloadJson,
+            telegramMessageId: parseStoredMessageId(delivery.messageId),
+            messageTimestamp: delivery.timestamp,
+            payloadJson: delivery.payloadJson,
           },
           {
-            chatId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
             direction: "outgoing",
           },
         );
 
         request.log.info(
           {
-            updateId: request.body?.update_id ?? null,
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            eventId: incomingMessage.eventId,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             incomingId: processedIncoming?.id ?? incoming.id,
             outgoingId: processedOutgoing?.id ?? outgoing.id,
-            telegramMessageId: telegramResponse.messageId,
-            delivered: telegramResponse.delivered,
+            externalMessageId: delivery.messageId,
+            delivered: delivery.delivered,
             status: "processed",
             textLength: replyText.length,
           },
-          "sent telegram response",
+          "sent outgoing response",
         );
 
         reply.send({
           ok: true,
           echoed: true,
-          delivered: telegramResponse.delivered,
+          delivered: delivery.delivered,
           replyText,
         });
       } catch (error) {
@@ -537,8 +379,9 @@ export function buildApp(
           incoming.id,
           { status: "failed" },
           {
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             direction: "incoming",
           },
         );
@@ -549,25 +392,27 @@ export function buildApp(
           {
             status: "failed",
             payloadJson: serializeErrorPayload(error),
-            messageTimestamp: buildMessageTimestamp(),
+            messageTimestamp: currentTimestamp(),
           },
           {
-            chatId,
+            adapter: incomingMessage.platform,
+            chatId: incomingMessage.chatId,
             direction: "outgoing",
           },
         );
 
         request.log.warn(
           {
-            updateId: request.body?.update_id ?? null,
-            chatId,
-            userId,
+            adapter: incomingMessage.platform,
+            eventId: incomingMessage.eventId,
+            chatId: incomingMessage.chatId,
+            userId: incomingMessage.userId,
             incomingId: incoming.id,
             outgoingId: outgoing.id,
             status: "failed",
             errorMessage: getErrorMessage(error),
           },
-          "telegram response failed",
+          "outgoing response failed",
         );
 
         throw error;

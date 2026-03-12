@@ -43,6 +43,11 @@ export type MessageStore = {
   close(): void;
 };
 
+type MessageStoreOptions = {
+  databaseFactory?: (databasePath: string) => Database.Database;
+  onJournalModeFallback?: (error: unknown) => void;
+};
+
 type MessageRow = {
   id: number;
   chat_id: string;
@@ -86,6 +91,27 @@ function hasOwnProperty<Key extends PropertyKey>(
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function configureJournalMode(
+  db: Database.Database,
+  onJournalModeFallback?: (error: unknown) => void,
+): void {
+  try {
+    db.pragma("journal_mode = WAL");
+  } catch (error) {
+    if (onJournalModeFallback) {
+      onJournalModeFallback(error);
+    } else {
+      console.warn(
+        `[db] WAL journal mode unavailable; continuing with SQLite default journal mode: ${getErrorMessage(error)}`,
+      );
+    }
+  }
+}
+
 function migrateMessagesTable(db: Database.Database): void {
   const columns = new Set(
     (db.pragma("table_info(messages)", { simple: false }) as Array<{ name: string }>)
@@ -105,11 +131,14 @@ function migrateMessagesTable(db: Database.Database): void {
   }
 }
 
-export function createMessageStore(databasePath: string): MessageStore {
+export function createMessageStore(
+  databasePath: string,
+  options: MessageStoreOptions = {},
+): MessageStore {
   ensureDatabaseDirectory(databasePath);
 
-  const db = new Database(databasePath);
-  db.pragma("journal_mode = WAL");
+  const db = options.databaseFactory?.(databasePath) ?? new Database(databasePath);
+  configureJournalMode(db, options.onJournalModeFallback);
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

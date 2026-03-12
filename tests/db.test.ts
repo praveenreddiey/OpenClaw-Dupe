@@ -140,3 +140,56 @@ test("createMessageStore migrates legacy tables and creates indexes", () => {
     temp.cleanup();
   }
 });
+
+test("createMessageStore falls back when WAL mode is unavailable", () => {
+  const temp = createTempDatabasePath();
+  let fallbackError: (Error & { code?: string }) | undefined;
+  let additionalJournalModePragma = false;
+
+  const store = createMessageStore(temp.filePath, {
+    databaseFactory(databasePath) {
+      const db = new Database(databasePath);
+      const originalPragma = db.pragma.bind(db);
+
+      db.pragma = ((source: string, options?: unknown) => {
+        if (source === "journal_mode = WAL") {
+          const error = new Error("disk I/O error") as Error & { code?: string };
+          error.code = "SQLITE_IOERR_SHMOPEN";
+          throw error;
+        }
+
+        if (source.startsWith("journal_mode = ")) {
+          additionalJournalModePragma = true;
+        }
+
+        return originalPragma(source, options as never);
+      }) as typeof db.pragma;
+
+      return db;
+    },
+    onJournalModeFallback(error) {
+      fallbackError = error as Error & { code?: string };
+    },
+  });
+
+  try {
+    const message = store.insertMessage({
+      chatId: "99",
+      userId: "5",
+      direction: "incoming",
+      status: "received",
+      text: "hello from fallback",
+      telegramMessageId: 14,
+      messageTimestamp: "2026-03-12T10:00:00.000Z",
+      payloadJson: "{\"kind\":\"incoming\"}",
+    });
+
+    assert.equal(fallbackError?.code, "SQLITE_IOERR_SHMOPEN");
+    assert.equal(additionalJournalModePragma, false);
+    assert.equal(message.chatId, "99");
+    assert.equal(store.listMessagesByChat("99").length, 1);
+  } finally {
+    store.close();
+    temp.cleanup();
+  }
+});
