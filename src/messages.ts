@@ -17,6 +17,12 @@ export type AdapterSendInput = {
   replyToMessageId?: string | null;
 };
 
+export type AdapterEditInput = {
+  chatId: string;
+  messageId: string;
+  text: string;
+};
+
 export type AdapterSendResult = {
   delivered: boolean;
   messageId: string | null;
@@ -32,4 +38,5 @@ export type MessageAdapter = {
   ): boolean;
   parseIncoming(body: unknown): UnifiedMessage | null;
   sendMessage(input: AdapterSendInput): Promise<AdapterSendResult>;
+  editMessage(input: AdapterEditInput): Promise<AdapterSendResult>;
 };

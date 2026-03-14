@@ -54,3 +54,20 @@ This file records post-milestone code review findings and suggested fixes.
 - Reviewed codebase after milestone sign-off; no new commits since 2026-03-08 reliability follow-up.
 - Findings: no additional issues identified; existing open items (#3–#5 from 2026-03-08 review) remain and should be addressed next.
 - Tests: not re-run (no code changes).
+
+## 2026-03-12 (IST) - Week 2 completion review
+
+### New findings
+
+#### 6. Background reply jobs are not durable across process restarts
+- Why it is a problem: The webhook now acknowledges Telegram quickly and finishes planning/streaming in the background. If the process restarts after the HTTP 200 but before the placeholder or final edit is delivered, Telegram will not retry and the user can be left without a reply.
+- Where it occurs: `src/app.ts`
+- Suggested improvements:
+  - Persist pending reply jobs in SQLite before returning 200.
+  - Add a small outbox/worker loop so unfinished jobs can resume after restart.
+  - Mark reply attempts with retryable vs terminal failure states.
+
+### Existing open items still relevant
+
+- Items #3, #4, and #5 remain open after the Week 2 implementation.
+- Tests reviewed for this milestone: `npm run build`, `npm test`.

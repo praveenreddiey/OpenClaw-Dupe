@@ -6,9 +6,11 @@ Quick start
 
 1. `npm install`
 2. Fill in `config.yaml` with your local values, especially `telegram.botToken`.
-3. `npm run build`
-4. `npm start`
-5. Visit `http://localhost:3000/health`
+3. Set `OPENAI_API_KEY` in your shell or `.env`.
+4. Optional: override `LLM_MODEL`, `OPENAI_BASE_URL`, `LIVE_LOOKUP_MODEL`, or other `LLM_*` / `LIVE_LOOKUP_*` environment variables.
+5. `npm run build`
+6. `npm start`
+7. Visit `http://localhost:3000/health`
 
 Telegram webhook
 
@@ -16,25 +18,31 @@ Telegram webhook
 2. Set `telegram.webhookSecret` so webhook requests are verified with Telegram's secret header.
 3. Adjust `telegram.requestTimeoutMs` if you want a different outbound timeout.
 4. Tune `telegram.rateLimitWindowMs` and `telegram.rateLimitMaxRequests` to limit chat spam.
-5. Point Telegram at the configured `telegram.webhookPath`.
-6. POST updates to that route and the bot will echo sanitized text messages back.
+5. Set `OPENAI_API_KEY` and optionally `LLM_MODEL`, `LLM_MAX_RESPONSE_TOKENS`, `LLM_REQUEST_TIMEOUT_MS`, `LIVE_LOOKUP_PROVIDER`, or `LIVE_LOOKUP_MODEL`.
+6. Point Telegram at the configured `telegram.webhookPath`.
+7. POST updates to that route and the bot will plan + stream sanitized LLM replies back to Telegram.
 
 Notes
 
 - Source lives in `src/`; compiled output is generated in `dist/`.
 - `npm run dev` currently does a build and starts the compiled server. Watch mode can be improved later.
 - `npm test` builds the project and runs the compiled Node test suite.
-- `npm start` now validates the Telegram runtime config before boot and fails fast if `telegram.botToken` is missing.
+- `npm start` now validates the Telegram and LLM runtime config before boot and fails fast if `telegram.botToken` or `OPENAI_API_KEY` is missing.
 - Incoming and outgoing Telegram messages are logged with metadata only, stored with `chat_id`, `user_id`, `message_id`, timestamps, and a status of `received`, `processed`, or `failed`.
 - SQLite adds indexes for chat, user, message, and timestamp lookups to keep message history queries fast.
-- SQLite prefers WAL mode, but automatically falls back to `DELETE` journal mode on Docker/Desktop bind mounts or synced folders that cannot open WAL shared-memory files.
+- SQLite prefers WAL mode, but automatically continues with SQLite's default journal mode on Docker/Desktop bind mounts or synced folders that cannot open WAL shared-memory files.
 - Inbound webhook handling now flows through a transport-neutral `UnifiedMessage` shape, with Telegram-specific parsing and delivery isolated in `TelegramAdapter` so future adapters can plug in more easily.
+- LLM calls use separate system and user messages, capped output tokens, request timeouts, redacted prompt/completion logs, and a unified `generate` / `stream` / `embeddings` interface.
+- The default OpenAI chat model is `gpt-5-mini`; override `LLM_MODEL` if you want a different model.
+- Accurate Mode now uses OpenAI web search for time-sensitive or year-specific prompts. For verified live-data requests like weather or rankings, it fails closed instead of guessing or sending users elsewhere.
+- The planner now includes a short slice of recent chat history so follow-up replies like `malayalam` can inherit the prior topic instead of being treated as isolated prompts.
+- Telegram replies are acknowledged quickly and then updated progressively as OpenAI stream chunks arrive.
 - Keep `config.yaml` out of git.
 
 - register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
 
   $token = ""
-    $webhookUrl = "/telegram/webhook"
+    $webhookUrl = "https://flex-naval-white-unto.trycloudflare.com/telegram/webhook"
     $secret = "my-secret-123"   # pick anything, but keep it in config too
     Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -ContentType "application/json" -Body (@{
   url = $webhookUrl
@@ -48,15 +56,23 @@ Notes
 docker compose --env-file .env down
 docker compose --env-file .env up --build
 
+Recommendation modes
+
+- Accurate Mode
+  Uses `liveLookup.provider: openai_search` to fetch up-to-date web-backed answers for time-sensitive or year-specific prompts such as current weather, IMDb-style rankings, and 2025 releases.
+- Best-guess Mode
+  If live lookup is unavailable for non-critical freshness requests, the normal chat model is prompted to use its internal knowledge and clearly label likely picks instead of jumping to unrelated older substitutes.
+  For verified live-data requests like weather, prices, scores, and rankings, the bot will not guess or send “check Google” style responses.
+
 Roadmap
 
 - Week 0: Init repo, TS config, config example, health check route. [done]
 
-- Week 1: Telegram webhook + echo bot, SQLite message model, pino logging
+- Week 1: Telegram webhook + echo bot, SQLite message model, pino logging [done]
   Gateway & Adapters
   Decouple: Use UnifiedMessage interface. Add TelegramAdapter now; Slack/WhatsApp become simple plugins later.
 
-- Week 2: LLM adapter (streaming OpenAI), simple planner prompt, SSE to Telegram replies.
+- Week 2: LLM adapter (streaming OpenAI), simple planner prompt, SSE to Telegram replies. [done]
 - Week 3: Skill runner in worker threads with time and memory limits, `fs_read`, `fs_write`, path allowlist.
 - Week 4: `shell_exec` skill with command allowlist and output cap, audit log table, basic red-team regex filter.
 - Week 5: Happy-path E2E test, stronger CLI dev flow, README setup polish.

@@ -5,6 +5,11 @@ services:
       - "3000:3000"
     environment:
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-5-mini}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+      LIVE_LOOKUP_PROVIDER: "${LIVE_LOOKUP_PROVIDER:-openai_search}"
+      LIVE_LOOKUP_MODEL: "${LIVE_LOOKUP_MODEL:-gpt-4o-mini-search-preview}"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

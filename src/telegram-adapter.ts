@@ -1,4 +1,5 @@
 import type {
+  AdapterEditInput,
   AdapterSendInput,
   AdapterSendResult,
   MessageAdapter,
@@ -37,6 +38,12 @@ export type TelegramSendInput = {
   replyToMessageId?: number;
 };
 
+export type TelegramEditInput = {
+  chatId: string;
+  messageId: number;
+  text: string;
+};
+
 export type TelegramSendResult = {
   delivered: boolean;
   messageId: number | null;
@@ -45,6 +52,7 @@ export type TelegramSendResult = {
 
 export type TelegramClient = {
   sendMessage(input: TelegramSendInput): Promise<TelegramSendResult>;
+  editMessageText(input: TelegramEditInput): Promise<TelegramSendResult>;
 };
 
 export class TelegramDeliveryError extends Error {
@@ -147,61 +155,76 @@ export function createTelegramClient(
   requestTimeoutMs: number,
   fetchImpl: typeof fetch = fetch,
 ): TelegramClient {
+  const callTelegramMethod = async (
+    method: "sendMessage" | "editMessageText",
+    body: Record<string, unknown>,
+  ): Promise<TelegramSendResult> => {
+    try {
+      const response = await fetchImpl(
+        `https://api.telegram.org/bot${botToken}/${method}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        },
+      );
+
+      const payloadText = await response.text();
+      const payload = payloadText
+        ? (JSON.parse(payloadText) as {
+            ok?: boolean;
+            result?: { message_id?: number };
+          })
+        : {};
+
+      if (!response.ok || !payload.ok) {
+        throw new TelegramDeliveryError(
+          `Telegram ${method} failed: ${parseTelegramErrorDescription(payloadText, response.statusText)}`,
+        );
+      }
+
+      return {
+        delivered: true,
+        messageId: payload.result?.message_id ?? null,
+        payloadJson: payloadText || null,
+      };
+    } catch (error) {
+      if (error instanceof TelegramDeliveryError) {
+        throw error;
+      }
+
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new TelegramDeliveryError(
+          `Telegram ${method} timed out after ${requestTimeoutMs}ms`,
+          504,
+          { cause: error },
+        );
+      }
+
+      throw new TelegramDeliveryError(`Telegram ${method} failed`, 502, {
+        cause: error,
+      });
+    }
+  };
+
   return {
     async sendMessage(input) {
-      try {
-        const response = await fetchImpl(
-          `https://api.telegram.org/bot${botToken}/sendMessage`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              chat_id: input.chatId,
-              text: input.text,
-              reply_to_message_id: input.replyToMessageId,
-            }),
-            signal: AbortSignal.timeout(requestTimeoutMs),
-          },
-        );
+      return callTelegramMethod("sendMessage", {
+        chat_id: input.chatId,
+        text: input.text,
+        reply_to_message_id: input.replyToMessageId,
+      });
+    },
 
-        const payloadText = await response.text();
-        const payload = payloadText
-          ? (JSON.parse(payloadText) as {
-              ok?: boolean;
-              result?: { message_id?: number };
-            })
-          : {};
-
-        if (!response.ok || !payload.ok) {
-          throw new TelegramDeliveryError(
-            `Telegram sendMessage failed: ${parseTelegramErrorDescription(payloadText, response.statusText)}`,
-          );
-        }
-
-        return {
-          delivered: true,
-          messageId: payload.result?.message_id ?? null,
-          payloadJson: payloadText || null,
-        };
-      } catch (error) {
-        if (error instanceof TelegramDeliveryError) {
-          throw error;
-        }
-
-        if (error instanceof Error && error.name === "TimeoutError") {
-          throw new TelegramDeliveryError(
-            `Telegram sendMessage timed out after ${requestTimeoutMs}ms`,
-            504,
-            { cause: error },
-          );
-        }
-
-        throw new TelegramDeliveryError("Telegram sendMessage failed", 502, {
-          cause: error,
-        });
-      }
+    async editMessageText(input) {
+      return callTelegramMethod("editMessageText", {
+        chat_id: input.chatId,
+        message_id: input.messageId,
+        text: input.text,
+      });
     },
   };
 }
@@ -260,6 +283,21 @@ export class TelegramAdapter implements MessageAdapter {
     return {
       delivered: result.delivered,
       messageId: result.messageId !== null ? String(result.messageId) : null,
+      payloadJson: result.payloadJson,
+      timestamp: buildMessageTimestamp(),
+    };
+  }
+
+  async editMessage(input: AdapterEditInput): Promise<AdapterSendResult> {
+    const result = await this.telegramClient.editMessageText({
+      chatId: input.chatId,
+      messageId: Number(input.messageId),
+      text: input.text,
+    });
+
+    return {
+      delivered: result.delivered,
+      messageId: result.messageId !== null ? String(result.messageId) : input.messageId,
       payloadJson: result.payloadJson,
       timestamp: buildMessageTimestamp(),
     };

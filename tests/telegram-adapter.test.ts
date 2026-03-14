@@ -10,6 +10,9 @@ test("TelegramAdapter parses updates into a UnifiedMessage", () => {
     async sendMessage() {
       throw new Error("sendMessage should not be called");
     },
+    async editMessageText() {
+      throw new Error("editMessageText should not be called");
+    },
   });
 
   const message = adapter.parseIncoming({
@@ -40,9 +43,12 @@ test("TelegramAdapter parses updates into a UnifiedMessage", () => {
   assert.match(message?.payloadJson ?? "", /hello\\nbot/);
 });
 
-test("TelegramAdapter verifies secrets and sends replies through the Telegram client", async () => {
+test("TelegramAdapter verifies secrets and can send and edit replies", async () => {
   let sentMessage:
     | { chatId: string; text: string; replyToMessageId?: number }
+    | undefined;
+  let editedMessage:
+    | { chatId: string; messageId: number; text: string }
     | undefined;
 
   const client: TelegramClient = {
@@ -52,6 +58,14 @@ test("TelegramAdapter verifies secrets and sends replies through the Telegram cl
         delivered: true,
         messageId: 9001,
         payloadJson: JSON.stringify({ ok: true, result: { message_id: 9001 } }),
+      };
+    },
+    async editMessageText(input) {
+      editedMessage = input;
+      return {
+        delivered: true,
+        messageId: input.messageId,
+        payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
       };
     },
   };
@@ -77,18 +91,30 @@ test("TelegramAdapter verifies secrets and sends replies through the Telegram cl
     false,
   );
 
-  const result = await adapter.sendMessage({
+  const sendResult = await adapter.sendMessage({
     chatId: "123456",
-    text: "Echo: hello",
+    text: "Thinking...",
     replyToMessageId: "77",
+  });
+  const editResult = await adapter.editMessage({
+    chatId: "123456",
+    messageId: "9001",
+    text: "Echo: hello",
   });
 
   assert.deepEqual(sentMessage, {
     chatId: "123456",
-    text: "Echo: hello",
+    text: "Thinking...",
     replyToMessageId: 77,
   });
-  assert.equal(result.delivered, true);
-  assert.equal(result.messageId, "9001");
-  assert.match(result.payloadJson ?? "", /9001/);
+  assert.deepEqual(editedMessage, {
+    chatId: "123456",
+    messageId: 9001,
+    text: "Echo: hello",
+  });
+  assert.equal(sendResult.delivered, true);
+  assert.equal(sendResult.messageId, "9001");
+  assert.equal(editResult.delivered, true);
+  assert.equal(editResult.messageId, "9001");
+  assert.match(editResult.payloadJson ?? "", /9001/);
 });

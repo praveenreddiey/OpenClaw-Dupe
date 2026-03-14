@@ -31,6 +31,7 @@ export type NewMessageRecord = {
 
 export type MessageUpdate = {
   status?: MessageStatus;
+  text?: string;
   telegramMessageId?: number | null;
   messageTimestamp?: string | null;
   payloadJson?: string | null;
@@ -210,6 +211,7 @@ export function createMessageStore(
     UPDATE messages
     SET
       status = @status,
+      text = @text,
       telegram_message_id = @telegram_message_id,
       message_timestamp = @message_timestamp,
       payload_json = @payload_json
@@ -265,6 +267,9 @@ export function createMessageStore(
       const nextStatus = hasOwnProperty(update, "status")
         ? (update.status as MessageStatus)
         : existing.status;
+      const nextText = hasOwnProperty(update, "text")
+        ? String(update.text ?? existing.text)
+        : existing.text;
       const nextTelegramMessageId = hasOwnProperty(update, "telegramMessageId")
         ? (update.telegramMessageId ?? null)
         : existing.telegram_message_id;
@@ -278,6 +283,7 @@ export function createMessageStore(
       updateStatement.run({
         id,
         status: nextStatus,
+        text: nextText,
         telegram_message_id: nextTelegramMessageId,
         message_timestamp: nextMessageTimestamp,
         payload_json: nextPayloadJson,

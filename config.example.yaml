@@ -8,6 +8,27 @@ logger:
 database:
   path: "./data/claw-dupe.db"
 
+# Prefer OPENAI_API_KEY from the environment for secrets.
+llm:
+  provider: "openai"
+  model: "gpt-5-mini"
+  embeddingModel: "text-embedding-3-small"
+  apiKey: ""
+  baseUrl: "https://api.openai.com/v1"
+  requestTimeoutMs: 15000
+  maxPromptChars: 4000
+  maxResponseTokens: 400
+  plannerMaxResponseTokens: 120
+  streamUpdateIntervalMs: 750
+
+liveLookup:
+  provider: "openai_search"
+  apiKey: ""
+  baseUrl: "https://api.openai.com/v1"
+  model: "gpt-4o-mini-search-preview"
+  requestTimeoutMs: 5000
+  maxOutputTokens: 500
+
 telegram:
   botToken: ""
   webhookPath: "/telegram/webhook"
