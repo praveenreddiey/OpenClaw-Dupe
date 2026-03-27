@@ -174,6 +174,12 @@
   - Files touched: `src/live-lookup.ts`, `tests/live-lookup.test.ts`, `tests/app.test.ts`.
   - Verification: `npm run build`; `node --test dist/tests/*.test.js` initially failed in the sandbox with `spawn EPERM`, then passed with elevated permissions, 58/58 passing.
 
+- 2026-03-27 (IST) - Added a code flow diagram image to the project
+  - Added a new PNG diagram at `docs/code-flow.png` that shows the high-level startup, webhook, live lookup, LLM, reply, and SQLite update flow.
+  - Kept the SVG source at `docs/code-flow.svg` and switched the README embed to the PNG so the project exposes a normal image file.
+  - Files touched: `README.md`, `docs/code-flow.png`, `docs/DEVLOG.md`.
+  - Verification: docs-only change; no build or test run needed.
+
 - 2026-03-14 (IST) - Concise final replies for Telegram
   - Added a final reply-shaping layer so verbose non-list answers are compacted into short human-readable Telegram replies, while structured shortlists keep their numbered format.
   - Tightened both the normal planner prompt and Accurate Mode live-lookup prompt to prefer 1-2 short sentences for non-list answers and avoid extended forecast/background dumps unless the user explicitly asks for them.
@@ -248,3 +254,9 @@
   - Added `docs/my own understanding` to `.gitignore` so the junior-friendly handoff notes stay local and do not show up as a tracked repo change by default.
   - Files touched: `.gitignore`, `docs/DEVLOG.md`.
   - Verification: repo-hygiene update only; no build or test run needed.
+
+- 2026-03-22 (IST) - Movie-title metadata questions now trigger Accurate Mode
+  - Fixed the live-lookup classifier so factual entertainment-title questions such as `is sentimental value a norwegian movie?` and short follow-ups like `then which language movie is this?` are treated as lookup-worthy metadata requests instead of plain chat completions.
+  - Added regression coverage in both the live-lookup unit tests and the Telegram webhook integration suite to confirm short follow-ups reuse recent title context and stay on the live-lookup path.
+  - Files touched: `src/live-lookup.ts`, `tests/live-lookup.test.ts`, `tests/app.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit; reran `node --test dist/tests/*.test.js` with elevated permissions and all 72 tests passed.

@@ -39,6 +39,17 @@ test("shouldUseLiveLookup detects year-specific recommendation requests", () => 
     true,
   );
   assert.equal(
+    shouldUseLiveLookup("is sentimental value a norwegian movie ?"),
+    true,
+  );
+  assert.equal(
+    shouldUseLiveLookup(
+      "then which language movie is this ?",
+      "User: is sentimental value a norwegian movie ?\nAssistant: I don't recognize that title yet.",
+    ),
+    true,
+  );
+  assert.equal(
     shouldUseLiveLookup("write a birthday message for my friend"),
     false,
   );
@@ -104,6 +115,20 @@ test("buildLiveLookupRequestText preserves exact digits for short numeric follow
   assert.match(requestText, /Preserve every digit exactly as written/i);
   assert.match(requestText, /\b2000\b/);
   assert.match(requestText, /<recent_conversation>/);
+});
+
+test("buildLiveLookupRequestText keeps movie-title context for short metadata follow-ups", () => {
+  const requestText = buildLiveLookupRequestText(
+    "then which language movie is this ?",
+    [
+      "User: is sentimental value a norwegian movie ?",
+      "Assistant: I don't recognize that title yet.",
+    ].join("\n"),
+  );
+
+  assert.match(requestText, /<recent_conversation>/);
+  assert.match(requestText, /is sentimental value a norwegian movie \?/i);
+  assert.match(requestText, /which language movie is this \?/i);
 });
 
 test("createLiveLookupClient parses a live lookup answer from OpenAI search output", async () => {

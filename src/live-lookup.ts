@@ -225,12 +225,15 @@ const LIVE_CUE_PATTERN = /\b(today|latest|current|recent|released?|release|relea
 const RANKING_CUE_PATTERN = /\b(imdb|rating|ratings|rank|ranked|ranking|chart|charts|box office|trending)\b/;
 const ENTITY_CUE_PATTERN = /\b(movie|movies|film|films|show|shows|series|song|songs|book|books|anime|restaurant|restaurants|place|places|app|apps|game|games|phone|phones|laptop|laptops|camera|cameras|course|courses|hotel|hotels|product|products)\b/;
 const PLURAL_ENTITY_CUE_PATTERN = /\b(movies|films|shows|series|songs|books|restaurants|places|apps|games|phones|laptops|cameras|courses|hotels|products)\b/;
+const SINGULAR_MEDIA_ENTITY_CUE_PATTERN = /\b(movie|film|show|series|song|book)\b/;
 const EVERGREEN_DISCOVERY_ENTITY_CUE_PATTERN = /\b(place|places|destination|destinations|spot|spots|trail|trails|trek|treks|beach|beaches|fort|forts|museum|museums|park|parks|temple|temples|monument|monuments)\b/;
 const TIME_BOUND_RELEASE_ENTITY_CUE_PATTERN = /\b(movie|movies|film|films|show|shows|series|song|songs|anime|game|games)\b/;
 const STRICT_FILTER_CUE_PATTERN = /\b(exact|actual|verified|only|released?|release|calendar year|this year|according to)\b/;
 const VERIFIED_LIVE_CUE_PATTERN = /\b(weather|news|latest|current|today|now|price|prices|score|scores|standings|imdb|rating|ratings|rank|ranked|ranking|chart|charts|box office|trending)\b/;
 const STRICT_VERIFIED_LIVE_CUE_PATTERN = /\b(weather|news|price|prices|score|scores|standings)\b/;
 const FOLLOW_UP_CONTEXT_CUE_PATTERN = /\b(only|just|same|that|this|those|these|released?|release|year|genre|language|platform)\b/;
+const MEDIA_METADATA_QUESTION_CUE_PATTERN = /\b(is|was|what|which|who)\b/;
+const MEDIA_METADATA_CUE_PATTERN = /\b(language|country|origin|director|directed|cast|actor|actress|release(?:d)?|year|platform|stream(?:ing)?|ott|norwegian|swedish|danish|french|german|spanish|italian|japanese|korean|chinese|hindi|telugu|tamil|malayalam|english)\b/;
 
 function normalizeLookupText(text: string): string {
   return text.trim().toLowerCase();
@@ -334,6 +337,12 @@ function isStrictVerifiedRecommendationRequest(normalizedText: string): boolean 
     );
 }
 
+function isMediaMetadataLookupRequest(normalizedText: string): boolean {
+  return MEDIA_METADATA_QUESTION_CUE_PATTERN.test(normalizedText) &&
+    MEDIA_METADATA_CUE_PATTERN.test(normalizedText) &&
+    SINGULAR_MEDIA_ENTITY_CUE_PATTERN.test(normalizedText);
+}
+
 export function buildLiveLookupRequestText(
   userText: string,
   conversationContext?: string,
@@ -375,6 +384,7 @@ export function shouldUseLiveLookup(
   }
 
   return VERIFIED_LIVE_CUE_PATTERN.test(normalized) ||
+    isMediaMetadataLookupRequest(normalized) ||
     isStrictVerifiedRecommendationRequest(normalized) ||
     isYearSpecificRecommendationRequest(normalized);
 }

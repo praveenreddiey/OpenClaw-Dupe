@@ -342,6 +342,141 @@ test("telegram webhook uses live lookup for year-specific requests before the no
   }
 });
 
+test("telegram webhook uses live lookup for movie-title metadata questions and short follow-ups", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const lookupInputs: string[] = [];
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9200,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9200 } }),
+        };
+      },
+      async editMessageText(input) {
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called when live lookup succeeds");
+      },
+      async *stream() {
+        throw new Error("stream should not be called when live lookup succeeds");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+    liveLookupClient: {
+      async lookup(userText) {
+        lookupInputs.push(userText);
+
+        if (/which language movie is this/i.test(userText)) {
+          return {
+            answer: "Sentimental Value is a Norwegian-language film.",
+            sources: [],
+            rawText: "{\"answer\":\"Sentimental Value is a Norwegian-language film.\"}",
+            model: "gpt-4o-mini-search-preview",
+          };
+        }
+
+        return {
+          answer: "Sentimental Value is a Norwegian film.",
+          sources: [],
+          rawText: "{\"answer\":\"Sentimental Value is a Norwegian film.\"}",
+          model: "gpt-4o-mini-search-preview",
+        };
+      },
+    },
+  });
+
+  try {
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 12,
+        message: {
+          message_id: 201,
+          text: "is sentimental value a norwegian movie ?",
+          date: 1_710_238_900,
+          chat: {
+            id: 654322,
+          },
+          from: {
+            id: 222,
+          },
+        },
+      },
+    });
+
+    assert.equal(firstResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      const messages = store.listMessagesByChat("654322");
+      assert.equal(messages.length, 2);
+      assert.equal(messages[1]?.status, "processed");
+      assert.equal(messages[1]?.text, "Sentimental Value is a Norwegian film.");
+    });
+
+    const secondResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 13,
+        message: {
+          message_id: 202,
+          text: "then which language movie is this ?",
+          date: 1_710_238_901,
+          chat: {
+            id: 654322,
+          },
+          from: {
+            id: 222,
+          },
+        },
+      },
+    });
+
+    assert.equal(secondResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      const messages = store.listMessagesByChat("654322");
+      assert.equal(messages.length, 4);
+      assert.equal(messages[3]?.status, "processed");
+      assert.equal(messages[3]?.text, "Sentimental Value is a Norwegian-language film.");
+    });
+
+    assert.equal(lookupInputs.length, 2);
+    assert.match(lookupInputs[0] ?? "", /is sentimental value a norwegian movie \?/i);
+    assert.match(lookupInputs[1] ?? "", /<recent_conversation>/);
+    assert.match(lookupInputs[1] ?? "", /is sentimental value a norwegian movie \?/i);
+    assert.match(lookupInputs[1] ?? "", /then which language movie is this \?/i);
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
 test("telegram webhook compacts verbose live recommendation replies into a short list", async () => {
   const temp = createTempDatabasePath();
   const store = createMessageStore(temp.filePath);

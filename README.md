@@ -2,6 +2,10 @@
 
 Developers: read `AGENTS.md` before making changes.
 
+## Code Flow
+
+![Code flow diagram](docs/code-flow.png)
+
 Quick start
 
 1. `npm install`
@@ -42,7 +46,7 @@ Notes
 - register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
 
   $token = ""
-    $webhookUrl = "https://flex-naval-white-unto.trycloudflare.com/telegram/webhook"
+    $webhookUrl = "/telegram/webhook"
     $secret = "my-secret-123"   # pick anything, but keep it in config too
     Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -ContentType "application/json" -Body (@{
   url = $webhookUrl
