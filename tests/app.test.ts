@@ -14,6 +14,14 @@ import {
 import type { LlmGenerateRequest, LlmStreamRequest } from "../src/llm.js";
 import type { AppConfig } from "../src/config.js";
 import { createMessageStore } from "../src/db.js";
+import { encodeStaticReminderPrompt } from "../src/reminders.js";
+import type { SkillRunner } from "../src/skill-runner.js";
+
+function getRequestTarget(
+  request: Parameters<SkillRunner["execute"]>[0],
+): string {
+  return "path" in request ? request.path : request.command;
+}
 
 function createTestConfig(databasePath: string): AppConfig {
   return {
@@ -54,6 +62,42 @@ function createTestConfig(databasePath: string): AppConfig {
       model: "gpt-4o-mini-search-preview",
       requestTimeoutMs: 5000,
       maxOutputTokens: 500,
+    },
+    skills: {
+      enabled: true,
+      timeoutMs: 2000,
+      maxOldGenerationSizeMb: 64,
+      maxReadBytes: 65536,
+      maxWriteBytes: 65536,
+      allowedPaths: ["./"],
+      blockedPaths: ["./.env", "./config.yaml", "./.git", "./node_modules", "./dist"],
+      shellEnabled: true,
+      shellWorkingDirectory: "./",
+      shellMaxOutputBytes: 16384,
+      shellAllowlist: [
+        {
+          command: "git status --short",
+          requiresConfirmation: false,
+        },
+        {
+          command: "npm run build",
+          requiresConfirmation: true,
+        },
+      ],
+    },
+    scheduler: {
+      enabled: false,
+      pollIntervalMs: 10000,
+      runTimeoutMs: 30000,
+      rateLimitWindowMs: 60000,
+      rateLimitMaxRuns: 2,
+      tasks: [],
+    },
+    viewer: {
+      enabled: true,
+      path: "/logs",
+      taskRunLimit: 25,
+      auditLogLimit: 50,
     },
   };
 }
@@ -221,6 +265,1399 @@ test("telegram webhook acknowledges quickly and streams an llm reply through Tel
     assert.equal(messages[0]?.userId, "444");
     assert.equal(messages[0]?.telegramMessageId, 77);
     assert.equal(messages[1]?.telegramMessageId, 9001);
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook executes fs_read skill requests without using the llm path", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const sentMessages: Array<{ chatId: string; text: string; replyToMessageId?: number }> = [];
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const observedRequests: Array<{ skillName: string; path: string }> = [];
+
+  const skillRunner: SkillRunner = {
+    async execute(request) {
+      observedRequests.push({
+        skillName: request.skillName,
+        path: getRequestTarget(request),
+      });
+
+      return {
+        success: true,
+        output: "# Claw Dupe\n\nDevelopers: read AGENTS.md before making changes.",
+        error: null,
+        meta: {
+          skillName: request.skillName,
+          targetPath: "README.md",
+          durationMs: 5,
+          resultSize: 63,
+        },
+      };
+    },
+  };
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage(input) {
+        sentMessages.push(input);
+        return {
+          delivered: true,
+          messageId: 9010,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9010 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    skillRunner,
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for direct skill requests");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for direct skill requests");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7001,
+        message: {
+          message_id: 144,
+          text: "/fs_read README.md",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_000,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(observedRequests.length, 1);
+      assert.deepEqual(observedRequests[0], {
+        skillName: "fs_read",
+        path: "README.md",
+      });
+      assert.equal(sentMessages.length, 1);
+      assert.equal(sentMessages[0]?.text, "Thinking...");
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /success: true/);
+      assert.match(editedMessages[0]?.text ?? "", /Developers: read AGENTS\.md/);
+    });
+
+    const messages = store.listMessagesByChat("123456");
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0]?.status, "processed");
+    assert.equal(messages[1]?.status, "processed");
+    assert.match(messages[1]?.text ?? "", /success: true/);
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook maps natural-language save requests to fs_write", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const observedRequests: Array<{ skillName: string; path: string; content?: string }> = [];
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9011,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9011 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    skillRunner: {
+      async execute(request) {
+        observedRequests.push({
+          skillName: request.skillName,
+          path: getRequestTarget(request),
+          content: "content" in request ? request.content : undefined,
+        });
+
+        return {
+          success: true,
+          output: "Wrote 10 bytes to name.txt.",
+          error: null,
+          meta: {
+            skillName: request.skillName,
+            targetPath: getRequestTarget(request),
+            durationMs: 4,
+            resultSize: 24,
+          },
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for direct skill requests");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for direct skill requests");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7002,
+        message: {
+          message_id: 145,
+          text: "Save file name as name.txt Content is hi praveen",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_001,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(observedRequests.length, 1);
+      assert.deepEqual(observedRequests[0], {
+        skillName: "fs_write",
+        path: "name.txt",
+        content: "hi praveen",
+      });
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /success: true/);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook maps natural-language read requests to fs_read", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const observedRequests: Array<{ skillName: string; path: string }> = [];
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9012,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9012 } }),
+        };
+      },
+      async editMessageText(input) {
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    skillRunner: {
+      async execute(request) {
+        observedRequests.push({
+          skillName: request.skillName,
+          path: getRequestTarget(request),
+        });
+
+        return {
+          success: true,
+          output: "hello from name.txt",
+          error: null,
+          meta: {
+            skillName: request.skillName,
+            targetPath: getRequestTarget(request),
+            durationMs: 3,
+            resultSize: 18,
+          },
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for direct skill requests");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for direct skill requests");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7003,
+        message: {
+          message_id: 146,
+          text: "Read file name.txt",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_002,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(observedRequests.length, 1);
+      assert.deepEqual(observedRequests[0], {
+        skillName: "fs_read",
+        path: "name.txt",
+      });
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates a scheduled reminder from natural language", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9014,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9014 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7004,
+        message: {
+          message_id: 147,
+          text: "remind me every 2 minutes to drink water",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_003,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /Created reminder for every 2 minutes/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: drink water/);
+      assert.doesNotMatch(editedMessages[0]?.text ?? "", /^success:/m);
+
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.schedule, "*/2 * * * *");
+      assert.equal(tasks[0]?.telegramChatId, "123456");
+      assert.equal(tasks[0]?.enabled, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: drink water");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates a recurring reminder from set-a-remainder phrasing", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9023,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9023 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 70045,
+        message: {
+          message_id: 145,
+          text: "set a remainder to drink water every 2 minutes",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_045,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /Created reminder for every 2 minutes/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: drink water/);
+      assert.doesNotMatch(editedMessages[0]?.text ?? "", /^success:/m);
+
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.schedule, "*/2 * * * *");
+      assert.equal(tasks[0]?.telegramChatId, "123456");
+      assert.equal(tasks[0]?.enabled, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: drink water");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook updates the same reminder when the interval changes", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9015,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9015 } }),
+        };
+      },
+      async editMessageText(input) {
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7005,
+        message: {
+          message_id: 148,
+          text: "remind me every 2 minutes to drink water",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_004,
+        },
+      },
+    });
+    assert.equal(firstResponse.statusCode, 200);
+
+    const secondResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7006,
+        message: {
+          message_id: 149,
+          text: "remind me every 10 minutes to drink water",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_005,
+        },
+      },
+    });
+    assert.equal(secondResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.schedule, "*/10 * * * *");
+      assert.equal(tasks[0]?.telegramChatId, "123456");
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: drink water");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates a one-time reminder from natural language", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9016,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9016 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7007,
+        message: {
+          message_id: 150,
+          text: "remind me to send email in 1 minute",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_006,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /one-time reminder in 1 minute/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: send email/);
+      assert.doesNotMatch(editedMessages[0]?.text ?? "", /^success:/m);
+
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.runOnce, true);
+      assert.equal(tasks[0]?.telegramChatId, "123456");
+      assert.equal(tasks[0]?.enabled, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: send email");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates an exact clock-time reminder from natural language", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9017,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9017 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7008,
+        message: {
+          message_id: 151,
+          text: "remind me at 2pm to send email",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_007,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /one-time reminder at 2:00 PM/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: send email/);
+      assert.doesNotMatch(editedMessages[0]?.text ?? "", /^success:/m);
+
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.runOnce, true);
+      assert.equal(tasks[0]?.telegramChatId, "123456");
+      assert.equal(tasks[0]?.enabled, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: send email");
+      assert.equal(tasks[0]?.schedule, "* * * * *");
+      assert.notEqual(tasks[0]?.nextRunAt, null);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates a reminder from set-a-reminder phrasing with IST", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9018,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9018 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7009,
+        message: {
+          message_id: 152,
+          text: "set a remainder at 2:36pm IST to go to shopping",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_008,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /one-time reminder at 2:36 PM/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: go to shopping/);
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.runOnce, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: go to shopping");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates a reminder from set-the-remainder phrasing", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9022,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9022 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7014,
+        message: {
+          message_id: 157,
+          text: "set the remainder at 2:54pm to go shopping",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_013,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /one-time reminder at 2:54 PM/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: go shopping/);
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.runOnce, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: go shopping");
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook creates an exact-date reminder from natural language", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9021,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9021 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder creation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder creation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7013,
+        message: {
+          message_id: 156,
+          text: "remind me on 31 March 2099 at 2pm to send email",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_012,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      assert.match(editedMessages[0]?.text ?? "", /one-time reminder on 31 March 2099 at 2:00 PM/i);
+      assert.match(editedMessages[0]?.text ?? "", /Reminder: send email/);
+      const tasks = store.listScheduledTasks();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0]?.runOnce, true);
+      assert.equal(tasks[0]?.prompt, "[[static-reminder]] Reminder: send email");
+      assert.match(tasks[0]?.nextRunAt ?? "", /^2099-03-31T/);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook lists active reminders for the current chat", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  store.upsertScheduledTask({
+    name: "reminder-123456-send-email",
+    schedule: "*/10 * * * *",
+    prompt: encodeStaticReminderPrompt("send email"),
+    enabled: true,
+    maxOutputTokens: 1,
+    telegramChatId: "123456",
+    runOnce: false,
+    nextRunAt: "2026-03-28T08:40:00.000Z",
+  });
+  store.upsertScheduledTask({
+    name: "reminder-once-123456-drink-water",
+    schedule: "* * * * *",
+    prompt: encodeStaticReminderPrompt("drink water"),
+    enabled: true,
+    maxOutputTokens: 1,
+    telegramChatId: "123456",
+    runOnce: true,
+    nextRunAt: "2026-03-28T09:00:00.000Z",
+  });
+  store.upsertScheduledTask({
+    name: "report-task",
+    schedule: "*/30 * * * *",
+    prompt: "plain scheduler task",
+    enabled: true,
+    maxOutputTokens: 50,
+    telegramChatId: "123456",
+    runOnce: false,
+    nextRunAt: "2026-03-28T10:00:00.000Z",
+  });
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9019,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9019 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder listing");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder listing");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7010,
+        message: {
+          message_id: 153,
+          text: "list the remainders",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_009,
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 1);
+      const reply = editedMessages[0]?.text ?? "";
+      assert.match(reply, /Your active reminders:/);
+      assert.match(reply, /\[\d+\] Reminder: send email/);
+      assert.match(reply, /\[\d+\] Reminder: drink water/);
+      assert.doesNotMatch(reply, /plain scheduler task/);
+      assert.doesNotMatch(reply, /^success:/m);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook cancels reminders by id and text", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const config = createTestConfig(temp.filePath);
+  config.scheduler.enabled = true;
+
+  const reminderById = store.upsertScheduledTask({
+    name: "reminder-123456-send-email",
+    schedule: "*/10 * * * *",
+    prompt: encodeStaticReminderPrompt("send email"),
+    enabled: true,
+    maxOutputTokens: 1,
+    telegramChatId: "123456",
+    runOnce: false,
+    nextRunAt: "2026-03-28T08:40:00.000Z",
+  });
+  store.upsertScheduledTask({
+    name: "reminder-once-123456-drink-water",
+    schedule: "* * * * *",
+    prompt: encodeStaticReminderPrompt("drink water"),
+    enabled: true,
+    maxOutputTokens: 1,
+    telegramChatId: "123456",
+    runOnce: true,
+    nextRunAt: "2026-03-28T09:00:00.000Z",
+  });
+
+  const app = buildApp(config, {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9020,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9020 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for reminder cancellation");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for reminder cancellation");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const cancelByIdResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7011,
+        message: {
+          message_id: 154,
+          text: `/cancel_reminder ${reminderById.id}`,
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_010,
+        },
+      },
+    });
+
+    assert.equal(cancelByIdResponse.statusCode, 200);
+
+    const cancelByTextResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7012,
+        message: {
+          message_id: 155,
+          text: "cancel reminder drink water",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_011,
+        },
+      },
+    });
+
+    assert.equal(cancelByTextResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.equal(editedMessages.length, 2);
+      assert.match(editedMessages[0]?.text ?? "", new RegExp(`Cancelled reminder \\[${reminderById.id}\\]`, "i"));
+      assert.match(editedMessages[1]?.text ?? "", /Cancelled reminder \[\d+\]: Reminder: drink water/i);
+      const tasks = store.listScheduledTasks();
+      assert.ok(tasks.every((task) => task.enabled === false));
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook requires confirmation before executing mutating shell commands", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+  const observedRequests: string[] = [];
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9013,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9013 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    skillRunner: {
+      async execute(request) {
+        observedRequests.push(getRequestTarget(request));
+        return {
+          success: true,
+          output: "build completed",
+          error: null,
+          meta: {
+            skillName: request.skillName,
+            targetPath: getRequestTarget(request),
+            durationMs: 25,
+            resultSize: 15,
+          },
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called for direct skill requests");
+      },
+      async *stream() {
+        throw new Error("stream should not be called for direct skill requests");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7100,
+        message: {
+          message_id: 200,
+          text: "/shell_exec npm run build",
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_100,
+        },
+      },
+    });
+
+    assert.equal(firstResponse.statusCode, 200);
+
+    let confirmationToken = "";
+    await waitForCondition(() => {
+      assert.equal(observedRequests.length, 0);
+      const confirmationReply = editedMessages.find((message) =>
+        /Confirmation required/i.test(message.text)
+      );
+      assert.ok(confirmationReply);
+      const tokenMatch = confirmationReply?.text.match(/\/confirm_shell ([a-f0-9-]+)/i);
+      assert.ok(tokenMatch?.[1]);
+      confirmationToken = tokenMatch?.[1] ?? "";
+    });
+
+    const confirmResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 7101,
+        message: {
+          message_id: 201,
+          text: `/confirm_shell ${confirmationToken}`,
+          chat: {
+            id: 123456,
+          },
+          from: {
+            id: 654321,
+          },
+          date: 1_700_000_101,
+        },
+      },
+    });
+
+    assert.equal(confirmResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.deepEqual(observedRequests, ["npm run build"]);
+      assert.ok(
+        editedMessages.some((message) => /build completed/.test(message.text)),
+      );
+      const audits = store.listToolAuditLogs(5);
+      assert.equal(audits.length, 1);
+      assert.equal(audits[0]?.status, "completed");
+      assert.equal(audits[0]?.commandText, "npm run build");
+    });
   } finally {
     await app.close();
     store.close();
@@ -1365,6 +2802,225 @@ test("telegram webhook compacts verbose live factual answers into a concise repl
         "As of 3:54 PM IST on March 14, 2026, in Chennai, India, the weather is hazy sunshine with a temperature of 92°F (34°C).",
       );
       assert.doesNotMatch(messages[1]?.text ?? "", /Daily Forecast|Sunday, March 15|##/i);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook preserves longer latest-news replies without aggressive truncation", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9152,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9152 } }),
+        };
+      },
+      async editMessageText(input) {
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        throw new Error("generate should not be called when live lookup returns a strong answer");
+      },
+      async *stream() {
+        throw new Error("stream should not be called when live lookup returns a strong answer");
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+    liveLookupClient: {
+      async lookup() {
+        return {
+          answer: [
+            "As of March 28, 2026, here are the latest developments in India across politics and policy.",
+            "Political update: major coalition discussions continued in Delhi with new cabinet coordination talks.",
+            "Economic update: markets reacted to inflation commentary and banking-sector policy signals.",
+            "Infrastructure update: rail and metro expansion announcements were highlighted by multiple states.",
+            "International update: regional diplomacy meetings focused on trade and border cooperation.",
+          ].join(" "),
+          sources: [],
+          rawText: "{\"answer\":\"latest-news\"}",
+          model: "gpt-4o-mini-search-preview",
+        };
+      },
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 122,
+        message: {
+          message_id: 1042,
+          text: "what is the latest news in india today",
+          date: 1_710_238_802,
+          chat: {
+            id: 700012,
+          },
+          from: {
+            id: 446,
+          },
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+
+    await waitForCondition(() => {
+      const messages = store.listMessagesByChat("700012");
+      assert.equal(messages.length, 2);
+      const reply = messages[1]?.text ?? "";
+      assert.match(reply, /As of March 28, 2026/i);
+      assert.match(reply, /- Political update:/i);
+      assert.match(reply, /- Economic update:/i);
+      assert.match(reply, /- Infrastructure update:/i);
+      assert.ok(reply.length > 320);
+      assert.match(reply, /\n-\s+/);
+    });
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("telegram webhook does not fail-closed on a plain hi after a timed-out latest-news lookup", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const editedMessages: Array<{ chatId: string; messageId: number; text: string }> = [];
+
+  const app = buildApp(createTestConfig(temp.filePath), {
+    messageStore: store,
+    telegramClient: {
+      async sendMessage() {
+        return {
+          delivered: true,
+          messageId: 9153,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: 9153 } }),
+        };
+      },
+      async editMessageText(input) {
+        editedMessages.push(input);
+        return {
+          delivered: true,
+          messageId: input.messageId,
+          payloadJson: JSON.stringify({ ok: true, result: { message_id: input.messageId } }),
+        };
+      },
+    },
+    llmClient: {
+      async generate() {
+        return {
+          model: "gpt-5-mini",
+          text: JSON.stringify({
+            intent: "answer_question",
+            objective: "Answer the user directly",
+            replyStyle: "concise",
+            mentionLimits: false,
+          }),
+        };
+      },
+      async *stream() {
+        yield {
+          type: "completed",
+          text: "Hello!",
+          model: "gpt-5-mini",
+        };
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+    liveLookupClient: {
+      async lookup() {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      },
+    },
+  });
+
+  try {
+    const newsResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 123,
+        message: {
+          message_id: 1043,
+          text: "what is the latest news in india today",
+          date: 1_710_238_803,
+          chat: {
+            id: 700013,
+          },
+          from: {
+            id: 447,
+          },
+        },
+      },
+    });
+
+    assert.equal(newsResponse.statusCode, 200);
+
+    const hiResponse = await app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      headers: {
+        "x-telegram-bot-api-secret-token": "secret-token",
+      },
+      payload: {
+        update_id: 124,
+        message: {
+          message_id: 1044,
+          text: "hi",
+          date: 1_710_238_804,
+          chat: {
+            id: 700013,
+          },
+          from: {
+            id: 447,
+          },
+        },
+      },
+    });
+
+    assert.equal(hiResponse.statusCode, 200);
+
+    await waitForCondition(() => {
+      assert.ok(editedMessages.length >= 2);
+      const latestReply = editedMessages.at(-1)?.text ?? "";
+      assert.equal(latestReply, "Hello!");
+      assert.doesNotMatch(
+        latestReply,
+        /I couldn't retrieve verified live data right now, so I won't guess/i,
+      );
     });
   } finally {
     await app.close();
@@ -3303,6 +4959,45 @@ test("telegram webhook returns a persistence error when storing messages fails",
       listMessagesByChat() {
         return [];
       },
+      insertToolAuditLog() {
+        throw new Error("should not insert tool audit logs");
+      },
+      updateToolAuditLog() {
+        throw new Error("should not update tool audit logs");
+      },
+      getPendingToolAuditLog() {
+        return null;
+      },
+      listToolAuditLogs() {
+        return [];
+      },
+      upsertScheduledTask() {
+        throw new Error("should not upsert scheduled tasks");
+      },
+      getScheduledTaskByName() {
+        return null;
+      },
+      updateScheduledTask() {
+        throw new Error("should not update scheduled tasks");
+      },
+      listScheduledTasks() {
+        return [];
+      },
+      listDueScheduledTasks() {
+        return [];
+      },
+      markScheduledTaskRunning() {
+        return null;
+      },
+      releaseStaleScheduledTasks() {
+        return 0;
+      },
+      insertScheduledTaskRun() {
+        throw new Error("should not insert scheduled task runs");
+      },
+      listScheduledTaskRuns() {
+        return [];
+      },
       close() {},
     },
     telegramClient: {
@@ -3354,5 +5049,96 @@ test("telegram webhook returns a persistence error when storing messages fails",
     });
   } finally {
     await app.close();
+  }
+});
+
+test("log viewer routes expose recent task and audit history", async () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+  const config = createTestConfig(temp.filePath);
+  const app = buildApp(config, {
+    messageStore: store,
+    llmClient: {
+      async generate() {
+        return {
+          model: "gpt-5-mini",
+          text: "ok",
+        };
+      },
+      async *stream() {
+        yield {
+          type: "completed",
+          text: "ok",
+          model: "gpt-5-mini",
+        };
+      },
+      async embeddings() {
+        return {
+          model: "text-embedding-3-small",
+          vectors: [],
+        };
+      },
+    },
+  });
+
+  try {
+    const task = store.upsertScheduledTask({
+      name: "heartbeat",
+      schedule: "* * * * *",
+      prompt: "Say hello",
+      enabled: true,
+      maxOutputTokens: 40,
+      nextRunAt: "2026-03-28T10:05:00.000Z",
+    });
+    store.insertScheduledTaskRun({
+      taskId: task.id,
+      taskName: task.name,
+      status: "completed",
+      startedAt: "2026-03-28T10:05:00.000Z",
+      finishedAt: "2026-03-28T10:05:02.000Z",
+      durationMs: 2000,
+      outputText: "scheduled task output",
+      errorText: null,
+    });
+    store.insertToolAuditLog({
+      chatId: "42",
+      userId: "7",
+      skillName: "shell_exec",
+      status: "completed",
+      userRequestText: "/shell_exec git status --short",
+      commandText: "git status --short",
+      outputText: "M README.md",
+      errorText: null,
+      durationMs: 15,
+      resultSize: 11,
+      requiresConfirmation: false,
+    });
+
+    const htmlResponse = await app.inject({
+      method: "GET",
+      url: "/logs",
+    });
+    assert.equal(htmlResponse.statusCode, 200);
+    assert.match(htmlResponse.body, /Claw Dupe Task Logs/);
+    assert.match(htmlResponse.body, /heartbeat/);
+    assert.match(htmlResponse.body, /git status --short/);
+
+    const jsonResponse = await app.inject({
+      method: "GET",
+      url: "/logs.json",
+    });
+    assert.equal(jsonResponse.statusCode, 200);
+    const payload = jsonResponse.json() as {
+      tasks: Array<{ name: string }>;
+      taskRuns: Array<{ taskName: string }>;
+      toolAudits: Array<{ commandText: string }>;
+    };
+    assert.equal(payload.tasks[0]?.name, "heartbeat");
+    assert.equal(payload.taskRuns[0]?.taskName, "heartbeat");
+    assert.equal(payload.toolAudits[0]?.commandText, "git status --short");
+  } finally {
+    await app.close();
+    store.close();
+    temp.cleanup();
   }
 });

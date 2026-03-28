@@ -114,3 +114,26 @@ This file records post-milestone code review findings and suggested fixes.
 - Why it is not a problem: `serializeErrorPayload(...)` only stores `name` and `message`, not the full error object. That means circular references and large nested payloads are not part of the current serialization path.
 - Where it occurs: `src/app.ts`
 - Current status: not logged as an issue for this code path.
+
+## 2026-03-27 (IST) - Week 3 completion review
+
+- Reviewed the new worker-thread skill runner for performance, architecture, functional correctness, concurrency behavior, code quality, and error handling.
+- Findings: no new Week 3 issues identified. Existing open items #3 through #10 remain relevant outside this milestone.
+- Tests reviewed: npm run build; node --test dist/tests/*.test.js with elevated permissions, 82/82 passing.
+## 2026-03-28 (IST) - Week 4 completion review
+
+- Reviewed the guarded shell execution path for allowlist enforcement, confirmation behavior, audit persistence, output limiting, error handling, and command-safety boundaries.
+- Findings: no new Week 4 issues identified. Existing open items #3 through #10 remain relevant outside this milestone.
+- Tests reviewed: npm run build; npm test with elevated execution, 100/100 passing.
+
+## 2026-03-28 (IST) - Week 5 completion review
+
+- Reviewed the updated developer workflow, reset-db helper, CI workflow, and end-to-end happy-path coverage for correctness, maintainability, and accidental test-environment side effects.
+- Findings: no new Week 5 issues identified. Existing open items #3 through #10 remain relevant outside this milestone.
+- Tests reviewed: npm run build; npm test with elevated execution, 100/100 passing.
+
+## 2026-03-28 (IST) - Week 6 completion review
+
+- Reviewed the Ollama adapter, scheduler loop, task persistence, overlap prevention, log viewer, and related config validation for functional correctness, concurrency behavior, and resilience.
+- Findings: no new Week 6 issues identified. Existing open items #3 through #10 remain relevant outside this milestone.
+- Tests reviewed: npm run build; npm test with elevated execution, 100/100 passing.

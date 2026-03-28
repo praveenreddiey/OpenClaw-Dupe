@@ -6,382 +6,398 @@ Developers: read `AGENTS.md` before making changes.
 
 ![Code flow diagram](docs/code-flow.png)
 
-Quick start
+## What It Does
+
+Claw Dupe is a Telegram-first assistant server built on Fastify. It can:
+
+- receive Telegram webhooks
+- plan and stream LLM replies
+- use live lookup for freshness-sensitive prompts
+- read and write approved files with `fs_read` and `fs_write`
+- execute a strict allowlist of shell commands with `shell_exec`
+- require manual confirmation before mutating shell commands run
+- schedule recurring LLM-backed tasks with cron-style schedules
+- expose a minimal web log viewer for scheduled runs and shell audits
+- switch between OpenAI and Ollama for the main LLM adapter
+
+## Quick Start
 
 1. `npm install`
-2. Fill in `config.yaml` with your local values, especially `telegram.botToken`.
-3. Set `OPENAI_API_KEY` in your shell or `.env`.
-4. Optional: override `LLM_MODEL`, `OPENAI_BASE_URL`, `LIVE_LOOKUP_MODEL`, or other `LLM_*` / `LIVE_LOOKUP_*` environment variables.
+2. Copy `config.example.yaml` to `config.yaml`
+3. Fill in `telegram.botToken` and `telegram.webhookSecret`
+4. Set secrets in your shell, especially `OPENAI_API_KEY` when using `llm.provider: openai`
 5. `npm run build`
 6. `npm start`
 7. Visit `http://localhost:3000/health`
+8. Visit `http://localhost:3000/logs` for the minimal task/audit viewer
 
-Telegram webhook
+## Development Commands
 
-1. Set `telegram.botToken` in `config.yaml`.
-2. Set `telegram.webhookSecret` so webhook requests are verified with Telegram's secret header.
-3. Adjust `telegram.requestTimeoutMs` if you want a different outbound timeout.
-4. Tune `telegram.rateLimitWindowMs` and `telegram.rateLimitMaxRequests` to limit chat spam.
-5. Set `OPENAI_API_KEY` and optionally `LLM_MODEL`, `LLM_MAX_RESPONSE_TOKENS`, `LLM_REQUEST_TIMEOUT_MS`, `LIVE_LOOKUP_PROVIDER`, or `LIVE_LOOKUP_MODEL`.
-6. Point Telegram at the configured `telegram.webhookPath`.
-7. POST updates to that route and the bot will plan + stream sanitized LLM replies back to Telegram.
+- `npm run dev`
+  Starts the server in watch mode through `tsx`.
+- `npm run build`
+  Compiles `src/` and `tests/` into `dist/`.
+- `npm start`
+  Runs the compiled server.
+- `npm test`
+  Builds and runs the compiled Node test suite.
+- `npm run lint`
+  Runs TypeScript type-checking without emitting files.
+- `npm run check`
+  Runs `lint` and `test`.
+- `npm run reset-db`
+  Deletes the configured SQLite database and its WAL/SHM sidecars inside the workspace.
+- `npm run redeploy:telegram`
+  Runs `docker compose --env-file .env down` and then `docker compose --env-file .env up --build -d`.
+- `npm run webhook:update`
+  Reads the latest Cloudflare tunnel URL from Docker logs and updates Telegram webhook without restarting Docker.
 
-Notes
+## Telegram Webhook Flow
 
-- Source lives in `src/`; compiled output is generated in `dist/`.
-- `npm run dev` currently does a build and starts the compiled server. Watch mode can be improved later.
-- `npm test` builds the project and runs the compiled Node test suite.
-- `npm start` now validates the Telegram and LLM runtime config before boot and fails fast if `telegram.botToken` or `OPENAI_API_KEY` is missing.
-- Incoming and outgoing Telegram messages are logged with metadata only, stored with `chat_id`, `user_id`, `message_id`, timestamps, and a status of `received`, `processed`, or `failed`.
-- SQLite adds indexes for chat, user, message, and timestamp lookups to keep message history queries fast.
-- SQLite prefers WAL mode, but automatically continues with SQLite's default journal mode on Docker/Desktop bind mounts or synced folders that cannot open WAL shared-memory files.
-- Inbound webhook handling now flows through a transport-neutral `UnifiedMessage` shape, with Telegram-specific parsing and delivery isolated in `TelegramAdapter` so future adapters can plug in more easily.
-- LLM calls use separate system and user messages, capped output tokens, request timeouts, redacted prompt/completion logs, and a unified `generate` / `stream` / `embeddings` interface.
-- The default OpenAI chat model is `gpt-5-mini`; override `LLM_MODEL` if you want a different model.
-- Accurate Mode now uses OpenAI web search for time-sensitive or year-specific prompts. For verified live-data requests like weather or rankings, it fails closed instead of guessing or sending users elsewhere.
-- The planner now includes a short slice of recent chat history so follow-up replies like `malayalam` can inherit the prior topic instead of being treated as isolated prompts.
-- Telegram replies are acknowledged quickly and then updated progressively as OpenAI stream chunks arrive.
-- Keep `config.yaml` out of git.
+1. Telegram POSTs an update to `telegram.webhookPath`
+2. Fastify verifies the Telegram secret header
+3. The app rate-limits, stores the incoming message, and replies to Telegram quickly
+4. A background task sends a placeholder reply
+5. The app either:
+   - handles a direct skill request
+   - tries live lookup for freshness-sensitive questions
+   - or plans and generates a normal LLM reply
+6. The final Telegram reply is edited or sent
+7. Incoming and outgoing message state is stored in SQLite
 
-- register the webhook after every deployment(once its registered, telegram posts messages to this url)(role of developer)
+## File Skills
 
-  $token = ""
-    $webhookUrl = "/telegram/webhook"
-    $secret = "my-secret-123"   # pick anything, but keep it in config too
-    Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -ContentType "application/json" -Body (@{
-  url = $webhookUrl
-  secret_token = $secret
-  drop_pending_updates = $true
-  allowed_updates = @("message","edited_message")
-  } | ConvertTo-Json)
+Week 3 is now live through Telegram:
 
---docker build
+- `/fs_read <path>`
+- `/fs_write <path>` followed by a newline and the content
 
+Natural language maps to the same file skills:
+
+- `Save file name as notes.txt content is hello`
+- `Read file notes.txt`
+
+Safety rules:
+
+- file access is restricted to `skills.allowedPaths`
+- dangerous paths in `skills.blockedPaths` stay blocked
+- reads and writes have byte caps
+- work runs inside isolated worker threads
+- every skill still returns structured `success`, `output`, `error`
+
+## Shell Skill
+
+Week 4 adds direct shell execution through:
+
+- `/shell_exec <command>`
+- `run command <command>`
+- `execute command <command>`
+
+The shell path is strict by design:
+
+- only exact commands in `skills.shellAllowlist` are allowed
+- dangerous executables such as `rm`, `sudo`, `chmod`, `curl`, `wget`, and shell-eval wrappers are blocked
+- command output is capped by `skills.shellMaxOutputBytes`
+- commands run inside `skills.shellWorkingDirectory`
+- risky prompts are blocked by a red-team regex layer
+- mutating commands must set `requiresConfirmation: true`
+- confirmation happens over Telegram with `/confirm_shell <token>` or `/cancel_shell <token>`
+- every shell command attempt is written to the SQLite `tool_audit_logs` table
+
+Example:
+
+```text
+/shell_exec git status --short
+```
+
+```text
+/shell_exec npm run build
+```
+
+The second example requires confirmation before it runs because the default allowlist marks it as mutating.
+
+## LLM Provider Toggle
+
+Week 6 adds a provider switch:
+
+- `llm.provider: openai`
+- `llm.provider: ollama`
+
+OpenAI notes:
+
+- use `OPENAI_API_KEY`
+- default base URL is `https://api.openai.com/v1`
+
+Ollama notes:
+
+- no API key is required
+- default base URL is `http://127.0.0.1:11434`
+- planner JSON responses are normalized and validated before use
+
+## Scheduler And Viewer
+
+Week 6 also adds a small cron-style scheduler plus a minimal viewer.
+
+Scheduler config lives under `scheduler`:
+
+- `enabled`
+- `pollIntervalMs`
+- `runTimeoutMs`
+- `rateLimitWindowMs`
+- `rateLimitMaxRuns`
+- `tasks`
+
+Each task includes:
+
+- `name`
+- `schedule`
+- `prompt`
+- `enabled`
+- `maxOutputTokens`
+- `telegramChatId` (optional, sends the task output to that Telegram chat)
+- `runOnce` (optional, disables the task after its first successful delivery)
+
+Example task that sends a Telegram message every 2 minutes:
+
+```yaml
+scheduler:
+  enabled: true
+  pollIntervalMs: 10000
+  runTimeoutMs: 30000
+  rateLimitWindowMs: 60000
+  rateLimitMaxRuns: 10
+  tasks:
+    - name: "two-minute-reminder"
+      schedule: "*/2 * * * *"
+      prompt: "Send one short check-in message saying the scheduler is working."
+      enabled: true
+      maxOutputTokens: 80
+      telegramChatId: "123456789"
+```
+
+The scheduler:
+
+- stores tasks in SQLite
+- logs every run into `scheduled_task_runs`
+- tracks duration and errors
+- prevents overlapping runs with a DB-backed `is_running` flag
+- rate-limits background task starts
+- optionally sends the completed task output as a Telegram text message when `telegramChatId` is set
+- stores delivered scheduled Telegram messages in the normal SQLite `messages` table as outgoing records
+
+## Chat Reminders
+
+When `scheduler.enabled` is on, you can create reminders directly from Telegram.
+
+Example:
+
+```text
+remind me every 10 minutes to drink water
+set a remainder to drink water every 2 minutes
+```
+
+Supported variations:
+
+```text
+set a reminder at 2:36pm IST to go shopping
+set a remainder at 2:36pm IST to go shopping
+set the remainder at 2:54pm to go shopping
+```
+
+One-time example:
+
+```text
+remind me to send email in 1 minute
+```
+
+Specific-time example:
+
+```text
+remind me at 2pm to send email
+```
+
+Exact-date example:
+
+```text
+remind me on 31 March at 2pm to send email
+```
+
+Tomorrow example:
+
+```text
+remind me tomorrow at 9:15am to join standup
+```
+
+What happens:
+
+- the bot creates or updates a scheduled task for that chat
+- the timing is parsed dynamically from your message
+- the reminder text is sent back deterministically as a reminder message, without relying on LLM phrasing
+- sending the same reminder text again with a different interval or clock time updates that reminder instead of creating a duplicate for the same chat/message
+- if you use `at 2pm` and that time has already passed today, the bot schedules it for the next day
+- if you use `on 31 March at 2pm` without a year and that date has already passed this year, the bot schedules it for the next year
+- one-time reminders disable themselves after the first successful send
+
+Current reminder limits:
+
+- chat-created reminders support `1` to `59` minute intervals
+- `scheduler.enabled` must be `true`
+
+Reminder management from Telegram:
+
+```text
+list my reminders
+list the remainders
+cancel reminder send email
+/cancel_reminder 12
+```
+
+- `list my reminders` and `list the remainders` show active reminders for the current chat, including their ids
+- `cancel reminder ...` disables matching reminders for the current chat only
+- `/cancel_reminder <id>` disables one specific reminder by id
+
+The viewer is enabled through `viewer` and defaults to:
+
+- HTML: `GET /logs`
+- JSON: `GET /logs.json`
+
+## Config Highlights
+
+Important sections in `config.yaml`:
+
+- `llm`
+- `liveLookup`
+- `skills`
+- `scheduler`
+- `viewer`
+- `telegram`
+
+The safest shell defaults are:
+
+```yaml
+skills:
+  shellEnabled: true
+  shellWorkingDirectory: "./"
+  shellMaxOutputBytes: 16384
+  shellAllowlist:
+    - command: "git status --short"
+      requiresConfirmation: false
+    - command: "npm test"
+      requiresConfirmation: false
+    - command: "npm run build"
+      requiresConfirmation: true
+```
+
+## Testing
+
+Current test coverage includes:
+
+- Telegram webhook happy path
+- direct file skills
+- shell confirmation flow
+- config validation
+- SQLite schema and persistence
+- OpenAI and Ollama adapters
+- scheduler execution
+- shell policy
+- planner and live lookup behavior
+- viewer routes
+
+External APIs are mocked in tests, and the shell skill is exercised through stubs in the app integration tests so test runs do not execute real shell commands.
+
+## CI
+
+GitHub Actions now runs:
+
+- `npm ci`
+- `npm run lint`
+- `npm test`
+
+See [`.github/workflows/ci.yml`](/C:/Users/prave/OneDrive/Documents/Claw%20Dupe/.github/workflows/ci.yml).
+
+## Docker Notes
+
+The current `docker-compose.yml` mounts:
+
+- `config.yaml`
+- `data/`
+- `C:/Users/prave/Downloads/ClawAllowed` as `/app/clawallowed`
+- the repo itself as `/app/workspace`
+
+Docker shell execution is now enabled safely with:
+
+- `SKILLS_ALLOWED_PATHS=/app/clawallowed;/app/workspace`
+- `SKILLS_BLOCKED_PATHS=/app/workspace/.env;/app/workspace/config.yaml;/app/workspace/.git;/app/workspace/node_modules;/app/workspace/dist`
+- `SKILLS_SHELL_ENABLED=true`
+- `SKILLS_TIMEOUT_MS=15000`
+- `SKILLS_SHELL_WORKING_DIRECTORY=/app/workspace`
+- `SKILLS_SHELL_ALLOWLIST=git status --short;npm run lint;npm run build`
+- `LLM_PLANNER_MAX_RESPONSE_TOKENS=240`
+- a dedicated `workspace_node_modules` Docker volume so `/app/workspace` uses Linux-compatible dependencies instead of the host `node_modules`
+- `git` installed inside the app image
+
+That means:
+
+- file skills can still use `/app/clawallowed/...`
+- shell commands run only inside `/app/workspace`
+- shell commands are limited to `git status --short`, `npm run lint`, and `npm run build`
+- `npm run build` still requires Telegram confirmation before execution
+
+Clock-time reminders in Docker follow the container timezone. The app service now sets:
+
+- `TZ=${TZ:-Asia/Calcutta}`
+
+So `remind me at 2pm to send email` is interpreted in your local timezone instead of UTC. If you want a different timezone later, set `TZ` in `.env` before starting Docker.
+
+## Docker Redeploy Helper
+
+If you are using the Cloudflare quick tunnel, the public `trycloudflare.com` URL can change after a rebuild. The repo now includes a one-command helper:
+
+```text
+npm run redeploy:telegram
+```
+
+It will:
+
+- stop the current Docker Compose stack
+- rebuild and restart the stack in detached mode
+
+Then run this separately when you want webhook refresh:
+
+```text
+npm run webhook:update
+```
+
+`webhook:update` will:
+
+- load `.env` locally so the Telegram bot token is available without printing it
+- poll the `tunnel` container logs until a fresh `https://...trycloudflare.com` URL appears
+- retry the Telegram webhook update while the new quick-tunnel hostname is still propagating
+- append `telegram.webhookPath` (so `/telegram/webhook` stays fixed)
+- call Telegram `setWebhook` with `drop_pending_updates: true`
+- include `telegram.webhookSecret` when it is configured through `config.yaml` or `TELEGRAM_WEBHOOK_SECRET`
+
+If you prefer two explicit steps, run:
+
+```text
 docker compose --env-file .env down
-docker compose --env-file .env up --build
+docker compose --env-file .env up --build -d
+npm run webhook:update
+```
 
-Recommendation modes
-
-- Accurate Mode
-  Uses `liveLookup.provider: openai_search` to fetch up-to-date web-backed answers for time-sensitive or year-specific prompts such as current weather, IMDb-style rankings, and 2025 releases.
-- Best-guess Mode
-  If live lookup is unavailable for non-critical freshness requests, the normal chat model is prompted to use its internal knowledge and clearly label likely picks instead of jumping to unrelated older substitutes.
-  For verified live-data requests like weather, prices, scores, and rankings, the bot will not guess or send “check Google” style responses.
-
-Roadmap
+## Roadmap Status
 
 - Week 0: Init repo, TS config, config example, health check route. [done]
-
-- Week 1: Telegram webhook + echo bot, SQLite message model, pino logging [done]
-  Gateway & Adapters
-  Decouple: Use UnifiedMessage interface. Add TelegramAdapter now; Slack/WhatsApp become simple plugins later.
-
-- Week 2: LLM adapter (streaming OpenAI), simple planner prompt, SSE to Telegram replies. [done]
-- Week 3: Skill runner in worker threads with time and memory limits, `fs_read`, `fs_write`, path allowlist.
-- Week 4: `shell_exec` skill with command allowlist and output cap, audit log table, basic red-team regex filter.
-- Week 5: Happy-path E2E test, stronger CLI dev flow, README setup polish.
-- Week 6: Ollama adapter toggle, cron scheduler, minimal web viewer for task logs.
-
-  Week 7: The "Eyes" (Browser Use & Vision)To book flights or check wedding venues, your bot needs to see the web like a human.The Tech: Integrate Playwright or Stagehand. Instead of just scraping HTML (which is messy and expensive), use Semantic Snapshots.How it works: The agent converts a webpage into a "simplified tree" of buttons and links (e.g., [12] "Search Flights" button). It then chooses actions like click(12) or type("Chennai").Day-to-Day: Send a link to a Zomato menu and say, "Order my usual chicken biryani if it's under ₹400." The bot logs in, checks the price, and handles the checkout.
-
-Week 8: Semantic Memory (The "Brain" Expansion)SQLite is good for logs; a Vector Database (like ChromaDB or Pinecone) is for "experience."The Tech: Every conversation and file the bot "reads" gets turned into a vector (a mathematical representation of meaning).How it works: When you ask, "What did the bike mechanic say about the chain last year?", the bot doesn't just search for "chain"—it searches for the concept of bike maintenance and finds the specific chat or PDF from months ago.Day-to-Day: The bot remembers that you prefer late-night flights and that your Gujarati lessons are currently focused on "family vocabulary," and it tailors its suggestions without being asked.
-
-Markdown Memory Persistence: Use MEMORY.md (truth) + logs/ (episodes). Distill: Auto-summarize logs to MD nightly.(just like open claw) dont use any vector database
-
-Week 9: Multi-Agent Handoffs (The "Squad")OpenClaw’s power comes from specialized agents. You can create a "Lane Queue" system where different agents handle different domains.The Roles:The Coder: Has full shell_exec access to your projects.The Researcher: Has browser_use to find flight prices or tech documentation.The Financial Manager: Only has access to your investment.db.Day-to-Day: You give one command: "Plan my Munnar trip." The Researcher finds flights; the Financial Manager checks if the ₹30 Lakh goal is safe; the Coder generates a calendar invite. They "talk" to each other to give you one final answer.
-
-Week 10: "Computer Use" (Local GUI Control)This is the current "State-of-the-Art" in 2026.The Tech: Use libraries like nut.js or RobotJS to let the AI control your actual mouse and keyboard.The Action: The AI can open your VS Code, move files into your Spotify, or fill out complex government forms (like a passport application) by looking at your screen.Safety: You implement a "Human-in-the-Loop" check where the bot sends a screenshot to Telegram and asks, "I'm about to click 'Pay Now'. Confirm?"
-
-precautions
-
-Week 0
-
-Init repo, TS config, config example, health check route
-
-Precautions
-
-Never commit secrets (Telegram token, API keys). Use .env and .gitignore.
-
-Lock your Node version using .nvmrc.
-
-Enable strict TypeScript settings (strict: true).
-
-Validate configuration values on startup to avoid runtime failures.
-
-Best Standards
-
-Use a single centralized config loader.
-
-Add ESLint + Prettier early to maintain consistent code style.
-
-Use structured logging from day one.
-
-Add a simple /health endpoint that checks DB connection and server status.
-
-Week 1
-
-Telegram webhook + echo bot, SQLite message model, pino logging.
-
-Precautions
-
-Verify webhook requests using a Telegram secret token.
-
-Add rate limiting to prevent spam or abuse.
-
-Sanitize incoming messages before storing them.
-
-Ensure database writes are wrapped in error handling.
-
-Best Standards
-
-Store chat_id, user_id, message_id, and timestamp.
-
-Log every incoming message and every outgoing response.
-
-Create a message status field (received, processed, failed).
-
-Use indexed columns in SQLite to keep queries fast.
-
-Week 2
-
-LLM adapter (streaming OpenAI), simple planner prompt, SSE to Telegram replies.
-
-Precautions
-
-Separate system prompts from user input to reduce prompt injection risks.
-
-Limit token usage and set max response tokens to control costs.
-
-Log prompts and completions for debugging.
-
-Implement request timeouts for LLM calls.
-
-Best Standards
-
-Create a unified LLM interface (generate, stream, embeddings).
-
-Design the planner prompt to be deterministic and clear.
-
-Implement streaming responses for better user experience.
-
-Add model configuration in environment variables for easy switching.
-
-Week 3
-
-Skill runner in worker threads with time and memory limits, fs_read, fs_write, path allowlist.
-
-Precautions
-
-Enforce strict execution time limits for every skill.
-
-Restrict file access using a path allowlist (never allow /).
-
-Prevent large file reads that could crash memory.
-
-Kill worker threads if they exceed limits.
-
-Best Standards
-
-Standardize skill responses (success, output, error).
-
-Log every tool call with duration and result size.
-
-Keep tools simple and single-purpose.
-
-Isolate worker threads from the main server process.
-
-Week 4
-
-shell_exec skill with command allowlist and output cap, audit log table, basic red-team regex filter.
-
-Precautions
-
-Never allow arbitrary commands; enforce a strict allowlist.
-
-Block dangerous commands such as rm, sudo, chmod, curl, wget.
-
-Limit command output size to prevent memory overload.
-
-Execute shell commands in a sandbox directory.
-
-Best Standards
-
-Maintain an audit log table for every executed command.
-
-Implement a basic red-team regex filter to detect risky prompts.
-
-Log the user request, command executed, and command output.
-
-Add manual confirmation for commands that modify files.
-
-Week 5
-
-Happy-path E2E test, stronger CLI dev flow, README setup polish.
-
-Precautions
-
-Mock external APIs during tests to avoid unnecessary costs.
-
-Ensure test environments cannot trigger real shell commands.
-
-Keep test databases separate from production databases.
-
-Best Standards
-
-Create end-to-end tests covering the main user flow.
-
-Provide CLI commands for development (start, test, reset-db).
-
-Document setup clearly in README.
-
-Automate linting and tests in CI pipelines.
-
-Week 6
-
-Ollama adapter toggle, cron scheduler, minimal web viewer for task logs.
-
-Precautions
-
-Validate responses from local models since they may produce malformed JSON.
-
-Prevent cron jobs from running concurrently if they overlap.
-
-Add rate limits to background tasks.
-
-Best Standards
-
-Implement a toggle to switch between OpenAI and Ollama.
-
-Store scheduled tasks in the database.
-
-Display task history in a simple log viewer.
-
-Track execution duration and errors for scheduled jobs.
-
-Week 7
-
-The "Eyes" (Browser Use & Vision)
-
-To book flights or check wedding venues, your bot needs to see the web like a human.
-
-The Tech: Integrate Playwright or Stagehand. Instead of just scraping HTML (which is messy and expensive), use Semantic Snapshots.
-
-How it works: The agent converts a webpage into a simplified tree of buttons and links (e.g., [12] "Search Flights" button). It then chooses actions like click(12) or type("Chennai").
-
-Day-to-Day: Send a link to a Zomato menu and say, "Order my usual chicken biryani if it's under ₹400." The bot logs in, checks the price, and handles the checkout.
-
-Precautions
-
-Limit the number of browser actions per task.
-
-Add page load timeouts to prevent hanging sessions.
-
-Avoid automatic form submissions without confirmation.
-
-Block payment actions unless the user confirms.
-
-Best Standards
-
-Use accessibility trees instead of raw HTML for navigation.
-
-Take screenshots for debugging failed browser tasks.
-
-Cache page snapshots when possible to reduce repeated browsing.
-
-Log every browser interaction step.
-
-Week 8
-
-Semantic Memory (The "Brain" Expansion)
-
-SQLite is good for logs; a Vector Database (like Chroma or Pinecone) is for experience.
-
-The Tech: Every conversation and file the bot reads gets turned into a vector (a mathematical representation of meaning).
-
-How it works: When you ask, "What did the bike mechanic say about the chain last year?", the bot searches for the concept of bike maintenance and retrieves the relevant chat or document.
-
-Day-to-Day: The bot remembers that you prefer late-night flights and that your Gujarati lessons are focused on family vocabulary.
-
-Precautions
-
-Avoid embedding sensitive information such as passwords or API keys.
-
-Limit memory growth by summarizing old conversations.
-
-Add metadata filters to prevent irrelevant memory retrieval.
-
-Best Standards
-
-Store timestamps and topic tags with every memory entry.
-
-Implement memory summarization to compress long conversations.
-
-Separate temporary context from long-term memory.
-
-Monitor vector database size regularly.
-
-Week 9
-
-Multi-Agent Handoffs (The "Squad")
-
-Systems like OpenClaw use specialized agents. You can create a lane queue system where different agents handle different domains.
-
-Roles:
-
-The Coder: Full shell_exec access.
-
-The Researcher: Browser automation to find information.
-
-The Financial Manager: Access only to financial data.
-
-Day-to-Day: You give one command: "Plan my Munnar trip." Agents coordinate to produce a final answer.
-
-Precautions
-
-Limit the number of agent handoffs to prevent infinite loops.
-
-Restrict each agent’s permissions strictly.
-
-Track communication between agents to detect errors.
-
-Best Standards
-
-Use a central planner agent to coordinate tasks.
-
-Keep agents specialized and minimal in capability.
-
-Log all agent decisions and results.
-
-Implement a task queue to manage agent workflows.
-
-Week 10
-
-Computer Use (Local GUI Control)
-
-The Tech: Use libraries like nut.js or RobotJS to control the mouse and keyboard.
-
-The Action: The AI can open VS Code, move files into Spotify, or fill out complex forms by observing the screen.
-
-Safety: Implement a Human-in-the-Loop system where the bot sends a screenshot to Telegram and asks for confirmation before critical actions.
-
-Precautions
-
-Always require confirmation for actions involving payments, file deletion, or system changes.
-
-Run GUI automation inside a virtual machine when possible.
-
-Restrict the directories and applications the AI can control.
-
-Best Standards
-
-Capture screenshots before and after each action.
-
-Maintain detailed logs of mouse and keyboard actions.
-
-Implement a cancel command that stops all ongoing automation.
-
-Limit automation session duration to avoid runaway processes.
-
-✅ If you want, I can also create a visual timeline + architecture evolution diagram from Week 0 → Week 10, which makes it much easier to understand how the system grows over time.
-
-Get smarter responses, upload files and images, and more.
+- Week 1: Telegram webhook + echo bot, SQLite message model, pino logging. [done]
+- Week 2: LLM adapter, planner prompt, streamed Telegram replies. [done]
+- Week 3: Worker-thread file skills with allowlists and limits. [done]
+- Week 4: Guarded `shell_exec`, audit logs, red-team filter. [done]
+- Week 5: Happy-path E2E coverage, stronger CLI flow, README polish, CI. [done]
+- Week 6: Ollama toggle, cron scheduler, minimal log viewer. [done]
+
+## Notes
+
+- Source lives in `src/`
+- Compiled output is generated in `dist/`
+- `config.yaml` stays local and should never be committed
+- SQLite prefers WAL mode but falls back automatically when WAL shared-memory files are unavailable

@@ -1,13 +1,18 @@
+import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import type { AppConfig } from "./config.js";
+import { getNextCronOccurrence } from "./cron.js";
 import {
   createMessageStore,
   type MessageRecord,
+  type ScheduledTaskRecord,
   type MessageStore,
   type MessageUpdate,
 } from "./db.js";
+import { createLlmClient } from "./llm-factory.js";
 import { LlmRequestError, type LlmClient, type LlmMessage } from "./llm.js";
 import type { MessageAdapter, UnifiedMessage } from "./messages.js";
+import { createOllamaLlmClient } from "./ollama-llm.js";
 import { createOpenAILlmClient } from "./openai-llm.js";
 import {
   buildResponseMessages,
@@ -26,14 +31,46 @@ import {
   type LiveLookupClient,
 } from "./live-lookup.js";
 import {
+  buildReminderCronExpression,
+  buildReminderDeliveryText,
+  buildReminderTaskName,
+  decodeStaticReminderPrompt,
+  encodeStaticReminderPrompt,
+  formatReminderInterval,
+  validateReminderIntervalMinutes,
+  type ReminderCreateRequest,
+} from "./reminders.js";
+import {
   createTelegramClient,
   TelegramAdapter,
   TelegramDeliveryError,
   type TelegramClient,
 } from "./telegram-adapter.js";
+import { createTaskScheduler, type TaskScheduler } from "./scheduler.js";
+import {
+  detectRiskyShellPrompt,
+  normalizeShellCommand,
+  resolveShellCommandPolicy,
+} from "./shell-policy.js";
+import { createSkillRunner, type SkillRunner } from "./skill-runner.js";
+import {
+  formatSkillResultForTelegram,
+  isReminderCancelRequest,
+  isReminderCreateRequest,
+  isReminderListRequest,
+  isSkillExecutionRequest,
+  parseSkillRequest,
+  type ParsedSkillRequest,
+  type SkillExecutionResult,
+  type SkillExecutionRequest,
+  type ShellExecSkillRequest,
+} from "./skills.js";
 
 export {
+  createLlmClient,
+  createOllamaLlmClient,
   createOpenAILlmClient,
+  createSkillRunner,
   createTelegramClient,
   TelegramAdapter,
   TelegramDeliveryError,
@@ -49,6 +86,8 @@ type BuildAppOptions = {
   telegramClient?: TelegramClient;
   llmClient?: LlmClient;
   liveLookupClient?: LiveLookupClient | null;
+  skillRunner?: SkillRunner | null;
+  taskScheduler?: TaskScheduler | null;
 };
 
 class MessagePersistenceError extends Error {
@@ -75,6 +114,7 @@ type BackgroundReplyOptions = {
   logger: FastifyBaseLogger;
   llmClient: LlmClient;
   liveLookupClient: LiveLookupClient | null;
+  skillRunner: SkillRunner | null;
   messageAdapter: MessageAdapter;
   messageStore: MessageStore;
   incomingMessage: UnifiedMessage;
@@ -704,6 +744,54 @@ function trimVerboseSections(userText: string, replyText: string): string {
     .trim();
 }
 
+function isNewsRequest(userText: string): boolean {
+  return /\b(news|headlines?|latest)\b/i.test(userText);
+}
+
+function buildCompactNewsReply(replyText: string): string {
+  const normalized = replyText
+    .replace(/\r\n/g, "\n")
+    .replace(/\n+/g, " ")
+    .replace(/[^\S\r\n]{2,}/g, " ")
+    .trim();
+  if (!normalized) {
+    return "";
+  }
+
+  let intro = "Latest updates:";
+  let withoutIntro = normalized;
+  if (/^As of\b/i.test(normalized)) {
+    const [firstSentence] = splitReplySentences(normalized);
+    if (firstSentence) {
+      intro = truncateAtWordBoundary(firstSentence, 180);
+      withoutIntro = normalized.slice(firstSentence.length).trim();
+    }
+  } else {
+    const introMatch = normalized.match(/^Here are[^:]{0,120}:\s*/i);
+    if (introMatch) {
+      intro = introMatch[0].trim();
+      withoutIntro = normalized.slice(introMatch[0].length).trim();
+    }
+  }
+
+  const categorySegments = withoutIntro
+    .split(/\s+(?=[A-Z][A-Za-z&/ ]{2,45}\s[-:]\s)/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const sentences = splitReplySentences(withoutIntro);
+  const items = (categorySegments.length >= 2 ? categorySegments : sentences)
+    .map((item) => item.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((item) => `- ${truncateAtWordBoundary(item, 220)}`);
+
+  if (items.length === 0) {
+    return truncateAtWordBoundary(normalized, 1200);
+  }
+
+  return `${intro}\n${items.join("\n")}`;
+}
+
 function makeTelegramReplyConcise(userText: string, replyText: string): string {
   const compact = trimVerboseSections(userText, replyText);
   if (!compact || isStructuredTelegramReply(compact)) {
@@ -723,6 +811,10 @@ function makeTelegramReplyConcise(userText: string, replyText: string): string {
 
   if (/\bweather\b/i.test(userText)) {
     return truncateAtWordBoundary(sentences[0] ?? compact, 220);
+  }
+
+  if (isNewsRequest(userText)) {
+    return buildCompactNewsReply(compact);
   }
 
   return truncateAtWordBoundary(sentences.slice(0, 2).join(" "), 320);
@@ -1142,6 +1234,441 @@ function buildProcessingFailureReply(error: unknown): string {
   return "Sorry, I hit an AI error while replying. Please try again.";
 }
 
+function getSkillRequestTarget(request: SkillExecutionRequest): string {
+  if ("path" in request) {
+    return request.path;
+  }
+
+  return request.command;
+}
+
+function buildSyntheticSkillResult(
+  request: SkillExecutionRequest,
+  success: boolean,
+  output: string | null,
+  error: string | null,
+): SkillExecutionResult {
+  const measuredText = output ?? error ?? "";
+
+  return {
+    success,
+    output,
+    error,
+    meta: {
+      skillName: request.skillName,
+      targetPath: getSkillRequestTarget(request),
+      durationMs: 0,
+      resultSize: Buffer.byteLength(measuredText, "utf8"),
+    },
+  };
+}
+
+function buildSkillUnavailableResult(request: SkillExecutionRequest): SkillExecutionResult {
+  const error = "Skills are disabled in this build.";
+
+  return buildSyntheticSkillResult(request, false, null, error);
+}
+
+function buildSyntheticReminderResult(
+  taskName: string,
+  success: boolean,
+  output: string | null,
+  error: string | null,
+  skillName: "reminder_create" | "reminder_list" | "reminder_cancel" = "reminder_create",
+): SkillExecutionResult {
+  const measuredText = output ?? error ?? "";
+
+  return {
+    success,
+    output,
+    error,
+    meta: {
+      skillName,
+      targetPath: taskName,
+      durationMs: 0,
+      resultSize: Buffer.byteLength(measuredText, "utf8"),
+    },
+  };
+}
+
+function formatReminderNextRun(nextRunAtIso: string): string {
+  return new Date(nextRunAtIso).toLocaleString("en-IN", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
+}
+
+type ChatReminderTask = {
+  task: ScheduledTaskRecord;
+  deliveryText: string;
+};
+
+function describeReminderSchedule(task: ScheduledTaskRecord): string {
+  if (task.runOnce) {
+    return task.nextRunAt
+      ? `Runs once at ${formatReminderNextRun(task.nextRunAt)}`
+      : "Runs once";
+  }
+
+  if (task.schedule === "* * * * *") {
+    return "Repeats every 1 minute";
+  }
+
+  const minuteMatch = task.schedule.match(/^\*\/(\d+)\s+\*\s+\*\s+\*\s+\*$/);
+  if (minuteMatch?.[1]) {
+    const intervalMinutes = Number.parseInt(minuteMatch[1], 10);
+    if (Number.isInteger(intervalMinutes) && intervalMinutes > 0) {
+      return `Repeats every ${intervalMinutes} minutes`;
+    }
+  }
+
+  return `Schedule: ${task.schedule}`;
+}
+
+function listChatReminderTasks(
+  messageStore: MessageStore,
+  chatId: string,
+  includeDisabled = false,
+): ChatReminderTask[] {
+  return messageStore
+    .listScheduledTasks()
+    .map((task) => ({
+      task,
+      deliveryText: decodeStaticReminderPrompt(task.prompt),
+    }))
+    .filter((entry): entry is ChatReminderTask =>
+      entry.task.telegramChatId === chatId &&
+      typeof entry.deliveryText === "string" &&
+      entry.deliveryText.length > 0 &&
+      (includeDisabled || entry.task.enabled)
+    )
+    .sort((left, right) => {
+      const leftTime = left.task.nextRunAt ?? "9999-12-31T23:59:59.999Z";
+      const rightTime = right.task.nextRunAt ?? "9999-12-31T23:59:59.999Z";
+      return leftTime.localeCompare(rightTime) || left.task.id - right.task.id;
+    });
+}
+
+function listRemindersForChat(
+  config: AppConfig,
+  messageStore: MessageStore,
+  incomingMessage: UnifiedMessage,
+): SkillExecutionResult {
+  const reminders = listChatReminderTasks(
+    messageStore,
+    incomingMessage.chatId,
+  );
+
+  if (reminders.length === 0) {
+    return buildSyntheticReminderResult(
+      `chat-${incomingMessage.chatId}`,
+      true,
+      "You do not have any active reminders right now.",
+      null,
+      "reminder_list",
+    );
+  }
+
+  const lines = ["Your active reminders:"];
+  for (const [index, entry] of reminders.entries()) {
+    lines.push(`${index + 1}. [${entry.task.id}] ${entry.deliveryText}`);
+    lines.push(`${describeReminderSchedule(entry.task)}`);
+    if (!entry.task.runOnce && entry.task.nextRunAt) {
+      lines.push(`Next run: ${formatReminderNextRun(entry.task.nextRunAt)}`);
+    }
+  }
+
+  lines.push("Cancel one with /cancel_reminder <id>.");
+
+  if (!config.scheduler.enabled) {
+    lines.push("Scheduler is currently disabled, so these reminders will not fire until it is turned back on.");
+  }
+
+  return buildSyntheticReminderResult(
+    `chat-${incomingMessage.chatId}`,
+    true,
+    lines.join("\n"),
+    null,
+    "reminder_list",
+  );
+}
+
+function cancelReminderTasks(
+  messageStore: MessageStore,
+  incomingMessage: UnifiedMessage,
+  parsedRequest: Extract<ParsedSkillRequest, { actionName: "reminder_cancel" }>,
+): SkillExecutionResult {
+  const reminders = listChatReminderTasks(
+    messageStore,
+    incomingMessage.chatId,
+    true,
+  );
+
+  if (parsedRequest.cancelMode === "id") {
+    const match = reminders.find((entry) => entry.task.id === parsedRequest.reminderId);
+    if (!match) {
+      return buildSyntheticReminderResult(
+        `chat-${incomingMessage.chatId}`,
+        false,
+        null,
+        `No reminder found with id ${parsedRequest.reminderId} for this chat.`,
+        "reminder_cancel",
+      );
+    }
+
+    if (!match.task.enabled) {
+      return buildSyntheticReminderResult(
+        `task-${match.task.id}`,
+        true,
+        `Reminder [${match.task.id}] is already disabled: ${match.deliveryText}`,
+        null,
+        "reminder_cancel",
+      );
+    }
+
+    messageStore.updateScheduledTask(match.task.id, {
+      enabled: false,
+      nextRunAt: null,
+      isRunning: false,
+    });
+
+    return buildSyntheticReminderResult(
+      `task-${match.task.id}`,
+      true,
+      `Cancelled reminder [${match.task.id}]: ${match.deliveryText}`,
+      null,
+      "reminder_cancel",
+    );
+  }
+
+  const matches = reminders.filter((entry) =>
+    entry.deliveryText.toLowerCase() === parsedRequest.reminderText.toLowerCase()
+  );
+
+  if (matches.length === 0) {
+    return buildSyntheticReminderResult(
+      `chat-${incomingMessage.chatId}`,
+      false,
+      null,
+      `No active reminder found matching: ${parsedRequest.reminderText}`,
+      "reminder_cancel",
+    );
+  }
+
+  const enabledMatches = matches.filter((entry) => entry.task.enabled);
+  if (enabledMatches.length === 0) {
+    return buildSyntheticReminderResult(
+      `chat-${incomingMessage.chatId}`,
+      true,
+      `Reminder is already disabled: ${parsedRequest.reminderText}`,
+      null,
+      "reminder_cancel",
+    );
+  }
+
+  for (const entry of enabledMatches) {
+    messageStore.updateScheduledTask(entry.task.id, {
+      enabled: false,
+      nextRunAt: null,
+      isRunning: false,
+    });
+  }
+
+  return buildSyntheticReminderResult(
+    `chat-${incomingMessage.chatId}`,
+    true,
+    enabledMatches.length === 1
+      ? `Cancelled reminder [${enabledMatches[0]?.task.id}]: ${enabledMatches[0]?.deliveryText}`
+      : `Cancelled ${enabledMatches.length} reminders matching: ${parsedRequest.reminderText}`,
+    null,
+    "reminder_cancel",
+  );
+}
+
+function upsertReminderTask(
+  logger: FastifyBaseLogger,
+  config: AppConfig,
+  messageStore: MessageStore,
+  incomingMessage: UnifiedMessage,
+  request: ReminderCreateRequest,
+): SkillExecutionResult {
+  if (!config.scheduler.enabled) {
+    return buildSyntheticReminderResult(
+      "reminder-disabled",
+      false,
+      null,
+      "Scheduler is disabled. Enable scheduler.enabled before creating reminders from chat.",
+    );
+  }
+
+  const taskName = buildReminderTaskName(
+    incomingMessage.chatId,
+    request.reminderText,
+    request.scheduleMode,
+  );
+  const existingTask = messageStore.getScheduledTaskByName(taskName);
+  const deliveryText = buildReminderDeliveryText(request.reminderText);
+  let schedule: string;
+  let nextRunAt: string;
+  let summaryText: string;
+
+  if (request.scheduleMode === "recurring") {
+    const intervalError = validateReminderIntervalMinutes(request.intervalMinutes);
+    if (intervalError) {
+      return buildSyntheticReminderResult(
+        "reminder-invalid-interval",
+        false,
+        null,
+        intervalError,
+      );
+    }
+
+    schedule = buildReminderCronExpression(request.intervalMinutes);
+    nextRunAt = getNextCronOccurrence(schedule, new Date()).toISOString();
+    summaryText = `${existingTask ? "Updated" : "Created"} reminder for ${formatReminderInterval(request.intervalMinutes)}.`;
+  } else {
+    schedule = "* * * * *";
+    nextRunAt = request.runAtIso;
+    summaryText = `${existingTask ? "Updated" : "Created"} one-time reminder ${request.timingText}.`;
+  }
+
+  messageStore.upsertScheduledTask({
+    name: taskName,
+    schedule,
+    prompt: encodeStaticReminderPrompt(request.reminderText),
+    enabled: true,
+    maxOutputTokens: 1,
+    telegramChatId: incomingMessage.chatId,
+    runOnce: request.scheduleMode === "once",
+    nextRunAt,
+  });
+
+  const result = buildSyntheticReminderResult(
+    taskName,
+    true,
+    [
+      summaryText,
+      `Message: ${deliveryText}`,
+      `${request.scheduleMode === "once" ? "Run at" : "Next run"}: ${formatReminderNextRun(nextRunAt)}`,
+    ].join("\n"),
+    null,
+  );
+
+  logger.info(
+    {
+      skillName: "reminder_create",
+      chatId: incomingMessage.chatId,
+      taskName,
+      scheduleMode: request.scheduleMode,
+      schedule,
+      nextRunAt,
+      timingText: request.scheduleMode === "once" ? request.timingText : null,
+      updatedExisting: Boolean(existingTask),
+    },
+    "created or updated scheduled reminder from chat",
+  );
+
+  return result;
+}
+
+function logSkillResult(
+  logger: FastifyBaseLogger,
+  result: SkillExecutionResult,
+): void {
+  const payload = {
+    skillName: result.meta.skillName,
+    targetPath: result.meta.targetPath,
+    durationMs: result.meta.durationMs,
+    resultSize: result.meta.resultSize,
+    success: result.success,
+  };
+
+  if (result.success) {
+    logger.info(payload, "completed skill call");
+    return;
+  }
+
+  logger.warn(
+    {
+      ...payload,
+      error: result.error,
+    },
+    "skill call failed",
+  );
+}
+
+function insertToolAuditLogOrThrow(
+  logger: FastifyBaseLogger,
+  messageStore: MessageStore,
+  entry: Parameters<MessageStore["insertToolAuditLog"]>[0],
+  context: Record<string, unknown>,
+) {
+  try {
+    return messageStore.insertToolAuditLog(entry);
+  } catch (error) {
+    logger.error({ err: error, ...context }, "failed to persist tool audit log");
+    throw new MessagePersistenceError("Failed to persist tool audit log", {
+      cause: error,
+    });
+  }
+}
+
+function updateToolAuditLogOrThrow(
+  logger: FastifyBaseLogger,
+  messageStore: MessageStore,
+  id: number,
+  update: Parameters<MessageStore["updateToolAuditLog"]>[1],
+  context: Record<string, unknown>,
+) {
+  try {
+    return messageStore.updateToolAuditLog(id, update);
+  } catch (error) {
+    logger.error({ err: error, toolAuditId: id, ...context }, "failed to update tool audit log");
+    throw new MessagePersistenceError("Failed to update tool audit log", {
+      cause: error,
+    });
+  }
+}
+
+function buildShellConfirmationRequiredResult(
+  request: ShellExecSkillRequest,
+  confirmationToken: string,
+): SkillExecutionResult {
+  return buildSyntheticSkillResult(
+    request,
+    false,
+    null,
+    `Confirmation required. Reply with /confirm_shell ${confirmationToken} to execute: ${normalizeShellCommand(request.command)}`,
+  );
+}
+
+function buildShellControlMissingResult(
+  request: ShellExecSkillRequest,
+  token: string,
+): SkillExecutionResult {
+  return buildSyntheticSkillResult(
+    request,
+    false,
+    null,
+    `No pending shell confirmation was found for token ${token}.`,
+  );
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function getResponseMaxOutputTokens(config: AppConfig): number {
   if (/^gpt-5/i.test(config.llm.model)) {
     return Math.max(config.llm.maxResponseTokens, 1000);
@@ -1173,6 +1700,13 @@ async function resolveLiveLookupReply(
   userText: string,
   conversationContext?: string,
 ): Promise<LiveLookupResolution> {
+  const normalizedUserText = userText.trim().toLowerCase();
+  if (/^(hi|hello|hey|yo|hola|hii+|heyy+)(?:\s+bot)?[.!?]*$/.test(normalizedUserText)) {
+    return {
+      replyText: null,
+    };
+  }
+
   const requiresVerifiedAnswer = requiresVerifiedLiveAnswer(
     userText,
     conversationContext,
@@ -1328,11 +1862,374 @@ async function recoverWithNonStreamingResponse(
   return generateResult.text;
 }
 
+function parseStoredShellRequest(requestJson: string | null): ShellExecSkillRequest | null {
+  if (!requestJson) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(requestJson) as Partial<ShellExecSkillRequest>;
+    if (parsed.skillName === "shell_exec" && typeof parsed.command === "string") {
+      return {
+        skillName: "shell_exec",
+        command: parsed.command,
+      };
+    }
+  } catch {
+    // Fall through to null.
+  }
+
+  return null;
+}
+
+function logShellAuditOutcome(
+  logger: FastifyBaseLogger,
+  status: string,
+  userRequestText: string,
+  commandText: string,
+  result: SkillExecutionResult,
+  toolAuditId: number | null,
+): void {
+  logger.info(
+    {
+      toolAuditId,
+      skillName: "shell_exec",
+      status,
+      userRequestText: redactForLog(userRequestText),
+      commandText,
+      output: result.output ? redactForLog(result.output) : null,
+      error: result.error,
+      durationMs: result.meta.durationMs,
+      resultSize: result.meta.resultSize,
+    },
+    "recorded shell command audit event",
+  );
+}
+
+async function executeShellRequestWithAudit(
+  logger: FastifyBaseLogger,
+  config: AppConfig,
+  messageStore: MessageStore,
+  skillRunner: SkillRunner | null,
+  incomingMessage: UnifiedMessage,
+  requestText: string,
+  request: ShellExecSkillRequest,
+): Promise<SkillExecutionResult> {
+  const riskyPromptError = detectRiskyShellPrompt(requestText);
+  if (riskyPromptError) {
+    const result = buildSyntheticSkillResult(request, false, null, riskyPromptError);
+    const audit = insertToolAuditLogOrThrow(
+      logger,
+      messageStore,
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+        status: "blocked",
+        userRequestText: requestText,
+        commandText: request.command,
+        outputText: null,
+        errorText: riskyPromptError,
+        resultSize: result.meta.resultSize,
+        requiresConfirmation: false,
+        requestJson: JSON.stringify(request),
+      },
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+      },
+    );
+    logShellAuditOutcome(
+      logger,
+      "blocked",
+      requestText,
+      request.command,
+      result,
+      audit.id,
+    );
+    return result;
+  }
+
+  const decision = resolveShellCommandPolicy(request.command, {
+    enabled: config.skills.shellEnabled,
+    allowlist: config.skills.shellAllowlist,
+  });
+  if (!decision.allowed) {
+    const result = buildSyntheticSkillResult(request, false, null, decision.error);
+    const audit = insertToolAuditLogOrThrow(
+      logger,
+      messageStore,
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+        status: "blocked",
+        userRequestText: requestText,
+        commandText: request.command,
+        outputText: null,
+        errorText: decision.error,
+        resultSize: result.meta.resultSize,
+        requiresConfirmation: false,
+        requestJson: JSON.stringify(request),
+      },
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+      },
+    );
+    logShellAuditOutcome(
+      logger,
+      "blocked",
+      requestText,
+      request.command,
+      result,
+      audit.id,
+    );
+    return result;
+  }
+
+  const normalizedRequest: ShellExecSkillRequest = {
+    skillName: "shell_exec",
+    command: decision.normalizedCommand,
+  };
+
+  if (decision.matchedEntry.requiresConfirmation) {
+    const confirmationToken = randomUUID().slice(0, 8);
+    insertToolAuditLogOrThrow(
+      logger,
+      messageStore,
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+        status: "pending_confirmation",
+        userRequestText: requestText,
+        commandText: normalizedRequest.command,
+        outputText: null,
+        errorText: null,
+        requiresConfirmation: true,
+        confirmationToken,
+        requestJson: JSON.stringify(normalizedRequest),
+      },
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+      },
+    );
+    return buildShellConfirmationRequiredResult(
+      normalizedRequest,
+      confirmationToken,
+    );
+  }
+
+  const audit = insertToolAuditLogOrThrow(
+    logger,
+    messageStore,
+    {
+      chatId: incomingMessage.chatId,
+      userId: incomingMessage.userId,
+      skillName: "shell_exec",
+      status: "started",
+      userRequestText: requestText,
+      commandText: normalizedRequest.command,
+      outputText: null,
+      errorText: null,
+      requiresConfirmation: false,
+      requestJson: JSON.stringify(normalizedRequest),
+    },
+    {
+      chatId: incomingMessage.chatId,
+      userId: incomingMessage.userId,
+      skillName: "shell_exec",
+    },
+  );
+
+  const result = skillRunner
+    ? await skillRunner.execute(normalizedRequest)
+    : buildSkillUnavailableResult(normalizedRequest);
+  updateToolAuditLogOrThrow(
+    logger,
+    messageStore,
+    audit.id,
+    {
+      status: result.success ? "completed" : "failed",
+      outputText: result.output,
+      errorText: result.error,
+      durationMs: result.meta.durationMs,
+      resultSize: result.meta.resultSize,
+    },
+    {
+      chatId: incomingMessage.chatId,
+      userId: incomingMessage.userId,
+      skillName: "shell_exec",
+    },
+  );
+  logShellAuditOutcome(
+    logger,
+    result.success ? "completed" : "failed",
+    requestText,
+    normalizedRequest.command,
+    result,
+    audit.id,
+  );
+  return result;
+}
+
+async function handleParsedSkillRequest(
+  logger: FastifyBaseLogger,
+  config: AppConfig,
+  messageStore: MessageStore,
+  skillRunner: SkillRunner | null,
+  incomingMessage: UnifiedMessage,
+  parsedRequest: ParsedSkillRequest,
+): Promise<SkillExecutionResult> {
+  if (isReminderCreateRequest(parsedRequest)) {
+    const result = upsertReminderTask(
+      logger,
+      config,
+      messageStore,
+      incomingMessage,
+      parsedRequest,
+    );
+    logSkillResult(logger, result);
+    return result;
+  }
+
+  if (isReminderListRequest(parsedRequest)) {
+    const result = listRemindersForChat(
+      config,
+      messageStore,
+      incomingMessage,
+    );
+    logSkillResult(logger, result);
+    return result;
+  }
+
+  if (isReminderCancelRequest(parsedRequest)) {
+    const result = cancelReminderTasks(
+      messageStore,
+      incomingMessage,
+      parsedRequest,
+    );
+    logSkillResult(logger, result);
+    return result;
+  }
+
+  if (isSkillExecutionRequest(parsedRequest)) {
+    if (parsedRequest.skillName === "shell_exec") {
+      return executeShellRequestWithAudit(
+        logger,
+        config,
+        messageStore,
+        skillRunner,
+        incomingMessage,
+        incomingMessage.text,
+        parsedRequest,
+      );
+    }
+
+    const result = skillRunner
+      ? await skillRunner.execute(parsedRequest)
+      : buildSkillUnavailableResult(parsedRequest);
+    logSkillResult(logger, result);
+    return result;
+  }
+
+  const pendingAudit = messageStore.getPendingToolAuditLog(
+    parsedRequest.token,
+    incomingMessage.chatId,
+    incomingMessage.userId,
+  );
+  const pendingRequest = parseStoredShellRequest(pendingAudit?.requestJson ?? null) ?? {
+    skillName: "shell_exec",
+    command: pendingAudit?.commandText ?? "shell_exec",
+  };
+
+  if (!pendingAudit) {
+    return buildShellControlMissingResult(pendingRequest, parsedRequest.token);
+  }
+
+  if (parsedRequest.controlName === "shell_cancel") {
+    updateToolAuditLogOrThrow(
+      logger,
+      messageStore,
+      pendingAudit.id,
+      {
+        status: "cancelled",
+        errorText: "Shell command cancelled by user.",
+        confirmedAt: currentTimestamp(),
+      },
+      {
+        chatId: incomingMessage.chatId,
+        userId: incomingMessage.userId,
+        skillName: "shell_exec",
+      },
+    );
+
+    return buildSyntheticSkillResult(
+      pendingRequest,
+      true,
+      `Cancelled shell command: ${pendingAudit.commandText ?? pendingRequest.command}`,
+      null,
+    );
+  }
+
+  updateToolAuditLogOrThrow(
+    logger,
+    messageStore,
+    pendingAudit.id,
+    {
+      status: "started",
+      confirmedAt: currentTimestamp(),
+    },
+    {
+      chatId: incomingMessage.chatId,
+      userId: incomingMessage.userId,
+      skillName: "shell_exec",
+    },
+  );
+
+  const result = skillRunner
+    ? await skillRunner.execute(pendingRequest)
+    : buildSkillUnavailableResult(pendingRequest);
+  updateToolAuditLogOrThrow(
+    logger,
+    messageStore,
+    pendingAudit.id,
+    {
+      status: result.success ? "completed" : "failed",
+      outputText: result.output,
+      errorText: result.error,
+      durationMs: result.meta.durationMs,
+      resultSize: result.meta.resultSize,
+      confirmedAt: currentTimestamp(),
+    },
+    {
+      chatId: incomingMessage.chatId,
+      userId: incomingMessage.userId,
+      skillName: "shell_exec",
+    },
+  );
+  logShellAuditOutcome(
+    logger,
+    result.success ? "completed" : "failed",
+    pendingAudit.userRequestText,
+    pendingAudit.commandText ?? pendingRequest.command,
+    result,
+    pendingAudit.id,
+  );
+  return result;
+}
+
 async function processIncomingMessage({
   config,
   logger,
   llmClient,
   liveLookupClient,
+  skillRunner,
   messageAdapter,
   messageStore,
   incomingMessage,
@@ -1490,26 +2387,33 @@ async function processIncomingMessage({
       );
     }
 
-    const promptText = truncateForPrompt(
-      resolvePromptText(
+    const parsedSkillRequest = parseSkillRequest(incomingMessage.text);
+    const promptText = parsedSkillRequest
+      ? ""
+      : truncateForPrompt(
+        resolvePromptText(
+          messageStore,
+          incomingMessage.chatId,
+          incomingRecord.id,
+          incomingMessage.text,
+        ),
+        config.llm.maxPromptChars,
+      );
+    const conversationContext = parsedSkillRequest
+      ? undefined
+      : buildConversationContext(
         messageStore,
         incomingMessage.chatId,
         incomingRecord.id,
-        incomingMessage.text,
-      ),
-      config.llm.maxPromptChars,
-    );
-    const conversationContext = buildConversationContext(
-      messageStore,
-      incomingMessage.chatId,
-      incomingRecord.id,
-    );
-    const liveLookup = await resolveLiveLookupReply(
-      logger,
-      liveLookupClient,
-      promptText,
-      conversationContext,
-    );
+      );
+    const liveLookup = parsedSkillRequest
+      ? { replyText: null }
+      : await resolveLiveLookupReply(
+        logger,
+        liveLookupClient,
+        promptText,
+        conversationContext,
+      );
     let lastSentText = "Thinking...";
     let lastEditAt = Date.now();
 
@@ -1558,8 +2462,19 @@ async function processIncomingMessage({
     };
     let streamedText = "";
     let finalReplyText = "";
+    let skillResult: SkillExecutionResult | null = null;
 
-    if (liveLookup.replyText) {
+    if (parsedSkillRequest) {
+      skillResult = await handleParsedSkillRequest(
+        logger,
+        config,
+        messageStore,
+        skillRunner,
+        incomingMessage,
+        parsedSkillRequest,
+      );
+      finalReplyText = formatSkillResultForTelegram(skillResult);
+    } else if (liveLookup.replyText) {
       finalReplyText = buildTelegramReadyReply(promptText, liveLookup.replyText);
     } else if (liveLookup.skipLlmFallback) {
       finalReplyText = buildTelegramReadyReply(
@@ -1722,20 +2637,119 @@ async function processIncomingMessage({
     );
 
     logger.info(
-      {
-        llmPhase: "response",
-        model: config.llm.model,
-        completion: redactForLog(finalReplyText),
-        adapter: incomingMessage.platform,
-        chatId: incomingMessage.chatId,
-        incomingId: incomingRecord.id,
-        outgoingId: outgoingRecord.id,
-      },
-      "completed response stream",
+      skillResult
+        ? {
+          adapter: incomingMessage.platform,
+          chatId: incomingMessage.chatId,
+          incomingId: incomingRecord.id,
+          outgoingId: outgoingRecord.id,
+          skillName: skillResult.meta.skillName,
+          targetPath: skillResult.meta.targetPath,
+          success: skillResult.success,
+        }
+        : {
+          llmPhase: "response",
+          model: config.llm.model,
+          completion: redactForLog(finalReplyText),
+          adapter: incomingMessage.platform,
+          chatId: incomingMessage.chatId,
+          incomingId: incomingRecord.id,
+          outgoingId: outgoingRecord.id,
+        },
+      skillResult ? "completed skill response" : "completed response stream",
     );
   } catch (error) {
     await failProcessing(error);
   }
+}
+
+function renderLogViewerHtml(
+  config: AppConfig,
+  messageStore: MessageStore,
+): string {
+  const tasks = messageStore.listScheduledTasks();
+  const taskRuns = messageStore.listScheduledTaskRuns(config.viewer.taskRunLimit);
+  const toolAuditLogs = messageStore.listToolAuditLogs(config.viewer.auditLogLimit);
+
+  const taskRows = tasks.map((task) => `
+    <tr>
+      <td>${escapeHtml(task.name)}</td>
+      <td>${escapeHtml(task.schedule)}</td>
+      <td>${task.enabled ? "enabled" : "disabled"}</td>
+      <td>${task.isRunning ? "yes" : "no"}</td>
+      <td>${escapeHtml(task.nextRunAt ?? "-")}</td>
+      <td>${escapeHtml(task.lastError ?? "-")}</td>
+    </tr>
+  `).join("");
+
+  const taskRunRows = taskRuns.map((run) => `
+    <tr>
+      <td>${escapeHtml(run.taskName)}</td>
+      <td>${escapeHtml(run.status)}</td>
+      <td>${escapeHtml(run.startedAt)}</td>
+      <td>${escapeHtml(run.finishedAt)}</td>
+      <td>${escapeHtml(String(run.durationMs ?? "-"))}</td>
+      <td><pre>${escapeHtml(run.outputText ?? run.errorText ?? "-")}</pre></td>
+    </tr>
+  `).join("");
+
+  const auditRows = toolAuditLogs.map((entry) => `
+    <tr>
+      <td>${escapeHtml(entry.skillName)}</td>
+      <td>${escapeHtml(entry.status)}</td>
+      <td>${escapeHtml(entry.commandText ?? entry.targetPath ?? "-")}</td>
+      <td>${escapeHtml(entry.createdAt)}</td>
+      <td>${escapeHtml(String(entry.durationMs ?? "-"))}</td>
+      <td><pre>${escapeHtml(entry.outputText ?? entry.errorText ?? "-")}</pre></td>
+    </tr>
+  `).join("");
+
+  return `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Claw Dupe Logs</title>
+        <style>
+          body { font-family: "Segoe UI", sans-serif; margin: 24px; background: #f5f7f4; color: #1f2933; }
+          h1, h2 { margin-bottom: 8px; }
+          table { width: 100%; border-collapse: collapse; margin-bottom: 24px; background: #fff; }
+          th, td { border: 1px solid #d9e2ec; padding: 8px; text-align: left; vertical-align: top; }
+          th { background: #e9f2ec; }
+          pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas, monospace; }
+          .meta { color: #52606d; margin-bottom: 20px; }
+        </style>
+      </head>
+      <body>
+        <h1>Claw Dupe Task Logs</h1>
+        <p class="meta">Provider: ${escapeHtml(config.llm.provider)} | Model: ${escapeHtml(config.llm.model)} | Updated: ${escapeHtml(currentTimestamp())}</p>
+
+        <h2>Scheduled Tasks</h2>
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Schedule</th><th>Enabled</th><th>Running</th><th>Next Run</th><th>Last Error</th></tr>
+          </thead>
+          <tbody>${taskRows || "<tr><td colspan=\"6\">No scheduled tasks yet.</td></tr>"}</tbody>
+        </table>
+
+        <h2>Recent Task Runs</h2>
+        <table>
+          <thead>
+            <tr><th>Task</th><th>Status</th><th>Started</th><th>Finished</th><th>Duration Ms</th><th>Output / Error</th></tr>
+          </thead>
+          <tbody>${taskRunRows || "<tr><td colspan=\"6\">No task runs recorded yet.</td></tr>"}</tbody>
+        </table>
+
+        <h2>Recent Tool Audits</h2>
+        <table>
+          <thead>
+            <tr><th>Skill</th><th>Status</th><th>Target</th><th>Created</th><th>Duration Ms</th><th>Output / Error</th></tr>
+          </thead>
+          <tbody>${auditRows || "<tr><td colspan=\"6\">No tool audits recorded yet.</td></tr>"}</tbody>
+        </table>
+      </body>
+    </html>
+  `;
 }
 
 export function buildApp(
@@ -1756,16 +2770,13 @@ export function buildApp(
     );
   const llmClient =
     options.llmClient ??
-    createOpenAILlmClient({
-      apiKey: config.llm.apiKey,
-      baseUrl: config.llm.baseUrl,
-      model: config.llm.model,
-      embeddingModel: config.llm.embeddingModel,
-      requestTimeoutMs: config.llm.requestTimeoutMs,
-    });
+    createLlmClient(config.llm);
   const liveLookupClient =
     options.liveLookupClient ??
     createLiveLookupClient(config.liveLookup);
+  const skillRunner =
+    options.skillRunner ??
+    (config.skills.enabled ? createSkillRunner(config.skills) : null);
   const rateLimiter = createRateLimiter(
     config.telegram.rateLimitWindowMs,
     config.telegram.rateLimitMaxRequests,
@@ -1776,6 +2787,18 @@ export function buildApp(
       level: config.logger.level,
     },
   });
+  const taskScheduler =
+    options.taskScheduler ??
+    (config.scheduler.enabled
+      ? createTaskScheduler({
+        config: config.scheduler,
+        llmMaxResponseTokens: config.llm.maxResponseTokens,
+        logger: app.log,
+        llmClient,
+        messageAdapter,
+        messageStore,
+      })
+      : null);
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof MessagePersistenceError) {
@@ -1798,6 +2821,9 @@ export function buildApp(
   });
 
   app.addHook("onClose", async () => {
+    if (taskScheduler) {
+      await taskScheduler.stop();
+    }
     if (ownsStore) {
       messageStore.close();
     }
@@ -1811,7 +2837,21 @@ export function buildApp(
     llmProvider: config.llm.provider,
     llmModel: config.llm.model,
     liveLookupProvider: config.liveLookup.provider,
+    schedulerEnabled: config.scheduler.enabled,
+    viewerPath: config.viewer.enabled ? config.viewer.path : null,
   }));
+
+  if (config.viewer.enabled) {
+    app.get(config.viewer.path, async (_request, reply) => {
+      reply.type("text/html").send(renderLogViewerHtml(config, messageStore));
+    });
+
+    app.get(`${config.viewer.path}.json`, async () => ({
+      tasks: messageStore.listScheduledTasks(),
+      taskRuns: messageStore.listScheduledTaskRuns(config.viewer.taskRunLimit),
+      toolAudits: messageStore.listToolAuditLogs(config.viewer.auditLogLimit),
+    }));
+  }
 
   app.post(
     config.telegram.webhookPath,
@@ -1904,6 +2944,7 @@ export function buildApp(
         logger: backgroundLogger,
         llmClient,
         liveLookupClient,
+        skillRunner,
         messageAdapter,
         messageStore,
         incomingMessage,
@@ -1916,6 +2957,10 @@ export function buildApp(
       });
     },
   );
+
+  if (taskScheduler) {
+    taskScheduler.start();
+  }
 
   return app;
 }

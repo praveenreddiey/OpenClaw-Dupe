@@ -1,5 +1,53 @@
 # Dev Log
 
+- 2026-03-28 (IST) - One-time Telegram reminders added
+  - Added one-time reminder parsing for messages like `remind me to send email in 1 minute` alongside the existing recurring `every N minutes` reminder flow.
+  - Extended scheduled task persistence with a `runOnce` flag so one-time reminders are stored durably and disable themselves after the first successful delivery.
+  - Added regression coverage for one-time reminder parsing, app-level creation, SQLite persistence, and scheduler auto-disable behavior.
+  - Files touched: `src/app.ts`, `src/config.ts`, `src/db.ts`, `src/reminders.ts`, `src/scheduler.ts`, `tests/app.test.ts`, `tests/config.test.ts`, `tests/db.test.ts`, `tests/scheduler.test.ts`, `tests/skill-runner.test.ts`, `README.md`, `config.example.yaml`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `node --test dist/tests/*.test.js` with elevated permissions and all 114 tests passed.
+
+- 2026-03-28 (IST) - Reminder confirmations now read like normal chat replies
+  - Updated the Telegram formatter so `reminder_create` replies return a human-friendly confirmation message instead of the generic `success / output / error` wrapper used by developer-oriented skills.
+  - Kept the structured formatter unchanged for file and shell skills, and added regression coverage for the reminder-only formatting behavior.
+  - Files touched: `src/skills.ts`, `tests/app.test.ts`, `tests/skill-runner.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit again; reran `node --test dist/tests/*.test.js` with elevated permissions.
+
+- 2026-03-28 (IST) - Telegram chat reminders with dynamic minute intervals
+  - Added direct Telegram reminder creation for phrases like `remind me every 10 minutes to drink water`.
+  - Parsed the requested minute interval dynamically, stored the reminder as a scheduled task in SQLite, and updated the same reminder task when the same chat repeats the same reminder text with a new interval.
+  - Made chat-created reminders deterministic by encoding them as static scheduled outputs so reminder delivery does not depend on LLM phrasing or blank completions.
+  - Files touched: `src/app.ts`, `src/reminders.ts`, `src/scheduler.ts`, `src/skills.ts`, `tests/app.test.ts`, `tests/scheduler.test.ts`, `tests/skill-runner.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit again; reran `node --test dist/tests/*.test.js` with elevated permissions and all 110 tests passed.
+
+- 2026-03-28 (IST) - Scheduler empty-output fallback improved
+  - Fixed scheduled Telegram reminders so blank model completions no longer send the literal `(no output)` placeholder to chats.
+  - Added a readable fallback message when a scheduled task completes with empty text, and added regression coverage for that path.
+  - Files touched: `src/scheduler.ts`, `tests/scheduler.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit again; reran `node --test dist/tests/*.test.js` with elevated permissions.
+
+- 2026-03-28 (IST) - Scheduler can now send recurring Telegram text messages
+  - Extended scheduled task config and SQLite persistence with an optional `telegramChatId`, including a safe migration for existing `scheduled_tasks` tables.
+  - Wired the scheduler through the existing Telegram adapter so successful cron runs can send real Telegram text messages and persist those deliveries into the normal `messages` table.
+  - Kept the existing log-only scheduler behavior unchanged for tasks that omit `telegramChatId`, and added regression coverage for config parsing, SQLite migration, successful delivery, and delivery failures.
+  - Files touched: `src/app.ts`, `src/config.ts`, `src/db.ts`, `src/scheduler.ts`, `tests/config.test.ts`, `tests/db.test.ts`, `tests/scheduler.test.ts`, `config.example.yaml`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit again; reran `node --test dist/tests/*.test.js` with elevated permissions and all 105 tests passed.
+
+- 2026-03-27 (IST) - Natural-language fs_read/fs_write mapping
+  - Added natural-language parsing so Telegram requests like `Save file name as name.txt content is hi praveen` map to `fs_write`, and requests like `Read file name.txt` map to `fs_read`.
+  - Kept explicit slash commands (`/fs_read`, `/fs_write`) unchanged and prioritized them before natural-language matching.
+  - Added parser regression tests plus app-level webhook tests to verify natural-language read/write requests execute through the skill runner and bypass the normal LLM path.
+  - Files touched: `src/skills.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` hit sandbox `spawn EPERM`; reran `node --test dist/tests/*.test.js` with elevated permissions and all 86 tests passed.
+
+- 2026-03-27 (IST) - Week 3 milestone completion
+  - Added a worker-thread skill runner with strict time and memory limits, direct Telegram `fs_read` and `fs_write` commands, file-size caps, and a configurable path allowlist plus blocked-path safety checks.
+  - Standardized skill results to `success`, `output`, and `error`, then logged every skill call with duration and result size without routing direct skill commands through the normal LLM path.
+  - Added regression coverage for the app-level skill path, worker-backed read/write execution, allowlist and blocked-path enforcement, read-limit failures, timeout handling, and the new skill config validation.
+  - Updated the config example and README so the new `skills` config block, `SKILLS_*` overrides, and Telegram command syntax are documented.
+  - Files touched: `src/app.ts`, `src/config.ts`, `src/skill-runner.ts`, `src/skill-worker.ts`, `src/skills.ts`, `tests/app.test.ts`, `tests/config.test.ts`, `tests/skill-runner.test.ts`, `config.example.yaml`, `README.md`, `docs/DEVLOG.md`, `ISSUES.md`.
+  - Verification: `npm run build`; `npm test` initially hit the sandbox `spawn EPERM` limit; reran `node --test dist/tests/*.test.js` with elevated permissions and all 82 tests passed.
+
 - 2026-03-10 (IST) - Week 1 milestone completion
   - Confirmed end-to-end Telegram echo via Cloudflare quick tunnel using webhook path `/telegram/webhook` and optional secret token.
   - No code changes; operational verification only. Verified by sending Telegram client messages and observing echo responses.
@@ -260,3 +308,135 @@
   - Added regression coverage in both the live-lookup unit tests and the Telegram webhook integration suite to confirm short follow-ups reuse recent title context and stay on the live-lookup path.
   - Files touched: `src/live-lookup.ts`, `tests/live-lookup.test.ts`, `tests/app.test.ts`, `docs/DEVLOG.md`.
   - Verification: `npm run build`; `npm test` hit the sandbox `spawn EPERM` limit; reran `node --test dist/tests/*.test.js` with elevated permissions and all 72 tests passed.
+
+- 2026-03-28 (IST) - Week 4 shell_exec milestone completed
+  - Added guarded `shell_exec` support to the skill system with a strict exact-command allowlist, blocked dangerous executables and interpreter-eval patterns, capped shell output, and execution inside a configured working directory.
+  - Added a red-team regex filter for risky shell prompts, manual confirmation for mutating allowlisted commands, and durable SQLite audit logging for shell requests through `tool_audit_logs`.
+  - Extended the Telegram webhook flow so `/shell_exec`, `run command ...`, `/confirm_shell`, and `/cancel_shell` work as direct skill/control requests without touching the normal LLM reply path.
+  - Files touched: `src/app.ts`, `src/config.ts`, `src/db.ts`, `src/shell-policy.ts`, `src/shell-executor.ts`, `src/skill-runner.ts`, `src/skill-worker.ts`, `src/skills.ts`, `tests/app.test.ts`, `tests/config.test.ts`, `tests/db.test.ts`, `tests/shell-policy.test.ts`, `tests/skill-runner.test.ts`.
+  - Verification: `npm run build`; `npm test` required elevated execution outside the sandbox because Node test worker spawning hit `spawn EPERM`, then all 100 tests passed.
+
+- 2026-03-28 (IST) - Week 5 developer workflow milestone completed
+  - Added a clearer CLI workflow with `npm run dev` watch mode, `npm run lint`, `npm run check`, and `npm run reset-db`.
+  - Added a dedicated reset-db helper script that only deletes the configured SQLite database inside the workspace.
+  - Expanded happy-path integration coverage and added a GitHub Actions CI workflow that runs `npm ci`, `npm run lint`, and `npm test`.
+  - Rewrote the README around the current feature set and setup flow.
+  - Files touched: `package.json`, `scripts/reset-db.ts`, `.github/workflows/ci.yml`, `README.md`, `tests/app.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` required elevated execution outside the sandbox because Node test worker spawning hit `spawn EPERM`, then all 100 tests passed.
+
+- 2026-03-28 (IST) - Week 6 Ollama, scheduler, and viewer milestone completed
+  - Added an Ollama LLM adapter plus provider toggle so the main reply path can switch between OpenAI and Ollama from config.
+  - Added cron-style scheduled tasks stored in SQLite with run history, duration/error tracking, overlap prevention through task locks, and background rate limiting.
+  - Added a minimal web log viewer at `/logs` with an accompanying JSON endpoint showing scheduled tasks, recent task runs, and recent tool audits.
+  - Updated config loading, config examples, and Docker defaults to account for the new provider, scheduler, viewer, and shell settings safely.
+  - Files touched: `src/app.ts`, `src/config.ts`, `src/cron.ts`, `src/db.ts`, `src/llm-factory.ts`, `src/ollama-llm.ts`, `src/scheduler.ts`, `config.example.yaml`, `docker-compose.yml`, `README.md`, `tests/ollama-llm.test.ts`, `tests/scheduler.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build`; `npm test` required elevated execution outside the sandbox because Node test worker spawning hit `spawn EPERM`, then all 100 tests passed.
+
+- 2026-03-28 (IST) - Docker shell sandbox enabled safely
+  - Updated Docker Compose so shell execution is enabled inside the container without opening it broadly.
+  - Added a dedicated repo mount at `/app/workspace`, kept `/app/clawallowed` for file skills, pinned shell execution to `/app/workspace`, and restricted the Docker shell allowlist to `git status --short`, `npm run lint`, and `npm run build`.
+  - Added Docker-specific blocked paths for `.env`, `config.yaml`, `.git`, `node_modules`, and `dist` inside the mounted workspace, and updated the README Docker notes to match the new container paths.
+  - Files touched: `docker-compose.yml`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: config/docs-only change; no additional build or test run required after the previously passing 100-test baseline.
+
+- 2026-03-28 (IST) - Docker shell commands fixed for git and lint/build
+  - Installed `git` in the Alpine app image so the Docker shell allowlist command `git status --short` can run inside the container.
+  - Added a Docker entrypoint that seeds `/app/workspace/node_modules` from the image's Linux dependencies, plus a dedicated `workspace_node_modules` volume so Docker shell commands do not depend on the host Windows `node_modules`.
+  - Raised the Docker skill timeout to `15000ms` so `npm run lint` and `npm run build` have enough time to complete through the shell skill.
+  - Updated Docker notes to explain the Linux-compatible workspace dependency volume and the higher shell timeout.
+  - Files touched: `Dockerfile`, `docker-compose.yml`, `scripts/docker-entrypoint.sh`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: Docker-specific patch prepared; rebuild the containers with `docker compose --env-file .env up --build` before retesting Telegram shell commands.
+
+- 2026-03-28 (IST) - Chat reminders now support exact clock times
+  - Added direct parsing for exact-time reminder phrases like `remind me at 2pm to send email`, `remind me to send email at 2pm`, and `remind me tomorrow at 9:15am to join standup`.
+  - Updated the reminder creation path so one-time reminders use exact `runAt` timestamps instead of pretending every one-time reminder is still a minute interval.
+  - Added parser coverage for same-day, next-day rollover, and explicit tomorrow reminders, plus an app-level Telegram webhook test for `at 2pm`.
+  - Files touched: `src/reminders.ts`, `src/app.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `116/116` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - Docker reminder timezone fix
+  - Identified that Docker was running in UTC, so exact-time reminders like `remind me at 2:25pm` were being stored as UTC clock times instead of local time.
+  - Added `TZ=${TZ:-Asia/Calcutta}` to the app service in `docker-compose.yml` so container-based clock-time reminders and their confirmation messages align with local time.
+  - Updated the README Docker notes to explain how clock-time reminders behave in Docker and how to override the timezone through `.env`.
+  - Files touched: `docker-compose.yml`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: config/docs-only Docker fix; no TypeScript build or test changes were required.
+
+- 2026-03-28 (IST) - Reminder management and typo-tolerant reminder parsing
+  - Added real reminder management commands for `list my reminders`, `list the remainders`, `cancel reminder <text>`, and `/cancel_reminder <id>`.
+  - Scoped reminder listing and cancellation to the current Telegram chat so chat users can only manage their own reminder tasks.
+  - Expanded reminder parsing to accept `set a reminder ...`, the common typo `set a remainder ...`, and clock times with suffixes like `IST`, preventing those messages from falling through to the normal LLM path.
+  - Added parser and app-level webhook coverage for the new reminder management commands and typo-tolerant reminder creation flow.
+  - Files touched: `src/reminders.ts`, `src/skills.ts`, `src/app.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `119/119` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - Exact-date reminder support
+  - Added calendar-date parsing for one-time reminders like `remind me on 31 March at 2pm to send email` and `remind me to pay rent on 5 April 2099 at 9am`.
+  - When the year is omitted and the requested date has already passed this year, the reminder now rolls forward to the next year instead of being scheduled in the past.
+  - Added parser coverage for same-year, next-year rollover, and explicit-year dates, plus an app-level Telegram webhook test for an exact-date reminder.
+  - Files touched: `src/reminders.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `120/120` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - Planner token-limit recovery for short chats
+  - Diagnosed Telegram reply failures for simple prompts like `hi` as planner-stage OpenAI truncation errors caused by the planner token budget being too low.
+  - Added a planner retry path that automatically retries with a larger token budget when OpenAI reports `max_tokens` or model-output-limit truncation.
+  - Raised the Docker default `LLM_PLANNER_MAX_RESPONSE_TOKENS` to `240` so container deployments are less likely to hit the planner limit on short chats.
+  - Added planner test coverage for the retry behavior and updated the Docker notes to document the higher planner budget.
+  - Files touched: `src/planner.ts`, `tests/planner.test.ts`, `docker-compose.yml`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `121/121` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - Reminder parser accepts `set the remainder ...`
+  - Fixed a phrasing gap where `set the remainder at 2:54pm ...` was falling through to the normal chat model instead of creating a real reminder task.
+  - Expanded the reminder-command normalization so both `set a ...` and `set the ...` forms map into the reminder parser.
+  - Added parser and webhook coverage for the exact phrase family so `set the remainder ...` creates a scheduler task instead of a misleading conversational reply.
+  - Files touched: `src/reminders.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `122/122` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - Recurring reminders accept `to ... every N minutes`
+  - Added recurring reminder parsing for phrases like `set a remainder to drink water every 2 minutes` and `remind me to stretch every 5 minutes`.
+  - This closes the gap where those messages were falling through to the normal chat model instead of creating real recurring reminder tasks.
+  - Added parser coverage and an app-level Telegram webhook test for the recurring `to ... every N minutes` phrasing.
+  - Files touched: `src/reminders.ts`, `tests/skill-runner.test.ts`, `tests/app.test.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `node --test dist/tests/*.test.js` passed `123/123` after elevated execution because the desktop sandbox blocked Node test worker spawning with `spawn EPERM`.
+
+- 2026-03-28 (IST) - One-command Docker redeploy plus Telegram webhook refresh
+  - Added a reusable redeploy helper module for parsing `.env`, extracting the latest Cloudflare quick-tunnel URL from Docker logs, and building the final Telegram webhook URL safely.
+  - Added `scripts/redeploy-telegram.ts` plus `npm run redeploy:telegram` so the repo can stop Docker, rebuild the stack, wait for the new tunnel URL, and call Telegram `setWebhook` in one step without printing the bot token.
+  - Added webhook retry handling for the quick-tunnel DNS propagation window so redeploys do not fail just because the new `trycloudflare.com` hostname is not immediately resolvable.
+  - Added focused unit tests for env parsing, tunnel URL extraction, and webhook retry classification helpers, and documented the retry behavior in the README.
+  - Files touched: `src/redeploy.ts`, `scripts/redeploy-telegram.ts`, `tests/redeploy.test.ts`, `package.json`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `npm test` passed with `128/128`.
+
+- 2026-03-28 (IST) - Added standalone webhook refresh command for 2-step Docker workflow
+  - Added `scripts/webhook-update.ts` and `npm run webhook:update` so webhook updates can be run independently after `docker compose down` and `up --build -d`.
+  - Reused existing safe behavior: token from `.env`, tunnel URL from Docker logs, fixed `/telegram/webhook` suffix via config path, and retry handling for temporary tunnel DNS propagation lag.
+  - Updated README with the explicit 2-step command sequence.
+  - Files touched: `scripts/webhook-update.ts`, `package.json`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. Runtime check passed with `docker compose --env-file .env down`, `docker compose --env-file .env up --build -d`, and `npm run webhook:update`.
+
+- 2026-03-28 (IST) - Split redeploy and webhook responsibilities
+  - Updated `npm run redeploy:telegram` to only perform Docker restart flow (`down` then `up --build -d`) and not attempt webhook updates.
+  - Kept `npm run webhook:update` as the dedicated webhook refresh command (token from `.env`, tunnel URL from logs, fixed webhook path suffix).
+  - Updated README command descriptions so the two-step workflow is explicit and predictable.
+  - Files touched: `scripts/redeploy-telegram.ts`, `README.md`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed.
+
+- 2026-03-28 (IST) - Reduced aggressive truncation for latest-news replies
+  - Added a dedicated news-intent branch in Telegram reply compaction so `latest news` style prompts preserve more content instead of being clipped to the generic short limit.
+  - Kept existing concise behavior for weather and general prompts, while raising the cap only for news-like requests.
+  - Added an app integration test to verify latest-news replies keep key sections and are not aggressively truncated.
+  - Files touched: `src/app.ts`, `tests/app.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm run build` passed. `npm test` passed with `129/129`.
+
+- 2026-03-28 (IST) - Latest-news replies now render as readable point-wise bullets
+  - Added a compact news formatter that converts long news paragraphs into a short heading plus bullet points for each update.
+  - Preserved category sections as bullets so replies like `latest news in india today` are easier to scan in Telegram.
+  - Updated the latest-news integration test to assert bullet-point formatting.
+  - Files touched: `src/app.ts`, `tests/app.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm test` passed with `129/129`.
+
+- 2026-03-28 (IST) - Fixed false fail-closed live-lookup behavior after latest-news timeouts
+  - Root cause: follow-up processing could push benign messages like `hi` through the verified-live-data path after a previous latest-news timeout.
+  - Fix: restored prompt-resolution flow for live lookup (so typo normalization and `try again` behavior stay intact) and added a greeting bypass so plain greetings do not trigger verified-live-data fail-closed responses.
+  - Added regression coverage for `hi` after a timed-out latest-news request.
+  - Files touched: `src/app.ts`, `tests/app.test.ts`, `docs/DEVLOG.md`.
+  - Verification: `npm test` passed with `130/130`.

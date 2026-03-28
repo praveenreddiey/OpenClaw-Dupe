@@ -9,6 +9,7 @@ database:
   path: "./data/claw-dupe.db"
 
 # Prefer OPENAI_API_KEY from the environment for secrets.
+# Set provider to "ollama" to use a local model instead.
 llm:
   provider: "openai"
   model: "gpt-5-mini"
@@ -28,6 +29,56 @@ liveLookup:
   model: "gpt-4o-mini-search-preview"
   requestTimeoutMs: 5000
   maxOutputTokens: 500
+
+skills:
+  enabled: true
+  timeoutMs: 2000
+  maxOldGenerationSizeMb: 64
+  maxReadBytes: 65536
+  maxWriteBytes: 65536
+  allowedPaths:
+    - "./"
+    - "C:/Users/prave/Downloads/ClawAllowed"
+  blockedPaths:
+    - "./.env"
+    - "./config.yaml"
+    - "./.git"
+    - "./node_modules"
+    - "./dist"
+  shellEnabled: true
+  shellWorkingDirectory: "./"
+  shellMaxOutputBytes: 16384
+  shellAllowlist:
+    - command: "git status --short"
+      requiresConfirmation: false
+      description: "Show the current repo status"
+    - command: "npm test"
+      requiresConfirmation: false
+      description: "Run the project test suite"
+    - command: "npm run build"
+      requiresConfirmation: true
+      description: "Build the project output"
+
+scheduler:
+  enabled: false
+  pollIntervalMs: 10000
+  runTimeoutMs: 30000
+  rateLimitWindowMs: 60000
+  rateLimitMaxRuns: 2
+  tasks:
+    - name: "two-minute-reminder"
+      schedule: "*/2 * * * *"
+      prompt: "Send one short check-in message saying the scheduler is working."
+      enabled: true
+      maxOutputTokens: 80
+      telegramChatId: "123456789"
+      runOnce: false
+
+viewer:
+  enabled: true
+  path: "/logs"
+  taskRunLimit: 25
+  auditLogLimit: 50
 
 telegram:
   botToken: ""

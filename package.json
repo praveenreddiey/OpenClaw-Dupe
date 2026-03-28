@@ -4,11 +4,17 @@
   "description": "",
   "main": "dist/src/server.js",
   "scripts": {
-    "dev": "npm run build && node dist/src/server.js",
+    "dev": "tsx watch src/server.ts",
+    "dev:compiled": "npm run build && node dist/src/server.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/src/server.js",
-    "test": "npm run build && node --test dist/tests/*.test.js"
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "check": "npm run lint && npm test",
+    "reset-db": "tsx scripts/reset-db.ts",
+    "redeploy:telegram": "tsx scripts/redeploy-telegram.ts",
+    "webhook:update": "tsx scripts/webhook-update.ts"
   },
   "keywords": [],
   "author": "",

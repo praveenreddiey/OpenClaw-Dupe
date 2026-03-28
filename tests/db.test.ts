@@ -193,3 +193,168 @@ test("createMessageStore falls back when WAL mode is unavailable", () => {
     temp.cleanup();
   }
 });
+
+test("createMessageStore persists tool audit logs and pending confirmations", () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+
+  try {
+    const created = store.insertToolAuditLog({
+      chatId: "42",
+      userId: "7",
+      skillName: "shell_exec",
+      status: "pending_confirmation",
+      userRequestText: "/shell_exec npm run build",
+      commandText: "npm run build",
+      requiresConfirmation: true,
+      confirmationToken: "abc123",
+      requestJson: JSON.stringify({
+        skillName: "shell_exec",
+        command: "npm run build",
+      }),
+    });
+
+    const pending = store.getPendingToolAuditLog("abc123", "42", "7");
+    assert.ok(pending);
+    assert.equal(pending?.id, created.id);
+    assert.equal(pending?.status, "pending_confirmation");
+
+    const updated = store.updateToolAuditLog(created.id, {
+      status: "completed",
+      confirmedAt: "2026-03-28T10:00:00.000Z",
+      durationMs: 123,
+      resultSize: 18,
+      outputText: "build finished ok",
+      errorText: null,
+    });
+
+    assert.equal(updated.status, "completed");
+    assert.equal(updated.durationMs, 123);
+    assert.equal(updated.outputText, "build finished ok");
+    assert.equal(store.listToolAuditLogs(10).length, 1);
+  } finally {
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("createMessageStore persists scheduled tasks and task runs", () => {
+  const temp = createTempDatabasePath();
+  const store = createMessageStore(temp.filePath);
+
+  try {
+    const task = store.upsertScheduledTask({
+      name: "heartbeat",
+      schedule: "* * * * *",
+      prompt: "Say hello",
+      enabled: true,
+      maxOutputTokens: 40,
+      telegramChatId: "chat-42",
+      runOnce: true,
+      nextRunAt: "2026-03-28T10:05:00.000Z",
+    });
+
+    const dueTasks = store.listDueScheduledTasks("2026-03-28T10:05:00.000Z");
+    assert.equal(dueTasks.length, 1);
+    assert.equal(dueTasks[0]?.id, task.id);
+    assert.equal(dueTasks[0]?.telegramChatId, "chat-42");
+    assert.equal(dueTasks[0]?.runOnce, true);
+
+    const claimed = store.markScheduledTaskRunning(task.id, "2026-03-28T10:05:01.000Z");
+    assert.equal(claimed?.isRunning, true);
+    assert.equal(store.markScheduledTaskRunning(task.id, "2026-03-28T10:05:02.000Z"), null);
+
+    const updatedTask = store.updateScheduledTask(task.id, {
+      telegramChatId: "chat-99",
+      runOnce: false,
+      isRunning: false,
+      lastFinishedAt: "2026-03-28T10:05:03.000Z",
+      lastDurationMs: 2000,
+      lastOutputPreview: "hello",
+      lastError: null,
+      nextRunAt: "2026-03-28T10:06:00.000Z",
+    });
+
+    assert.equal(updatedTask.isRunning, false);
+    assert.equal(updatedTask.lastOutputPreview, "hello");
+    assert.equal(updatedTask.telegramChatId, "chat-99");
+    assert.equal(updatedTask.runOnce, false);
+
+    const run = store.insertScheduledTaskRun({
+      taskId: task.id,
+      taskName: task.name,
+      status: "completed",
+      startedAt: "2026-03-28T10:05:01.000Z",
+      finishedAt: "2026-03-28T10:05:03.000Z",
+      durationMs: 2000,
+      outputText: "hello",
+      errorText: null,
+    });
+
+    assert.equal(run.taskName, "heartbeat");
+    assert.equal(run.status, "completed");
+    assert.equal(store.listScheduledTaskRuns(10).length, 1);
+  } finally {
+    store.close();
+    temp.cleanup();
+  }
+});
+
+test("createMessageStore migrates scheduled tasks to support telegram chat targets", () => {
+  const temp = createTempDatabasePath();
+  const legacyDb = new Database(temp.filePath);
+  legacyDb.exec(`
+    CREATE TABLE scheduled_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      schedule TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      max_output_tokens INTEGER NOT NULL,
+      next_run_at TEXT,
+      is_running INTEGER NOT NULL DEFAULT 0,
+      last_started_at TEXT,
+      last_finished_at TEXT,
+      last_duration_ms INTEGER,
+      last_error TEXT,
+      last_output_preview TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  legacyDb.close();
+
+  const store = createMessageStore(temp.filePath);
+
+  try {
+    const task = store.upsertScheduledTask({
+      name: "heartbeat",
+      schedule: "* * * * *",
+      prompt: "Say hello",
+      enabled: true,
+      maxOutputTokens: 40,
+      telegramChatId: "chat-42",
+      runOnce: true,
+      nextRunAt: "2026-03-28T10:05:00.000Z",
+    });
+
+    assert.equal(task.telegramChatId, "chat-42");
+    assert.equal(task.runOnce, true);
+  } finally {
+    store.close();
+  }
+
+  const inspectDb = new Database(temp.filePath, { readonly: true });
+
+  try {
+    const columns = inspectDb
+      .prepare("PRAGMA table_info(scheduled_tasks)")
+      .all() as Array<{ name: string }>;
+
+    assert.ok(columns.some((column) => column.name === "telegram_chat_id"));
+    assert.ok(columns.some((column) => column.name === "run_once"));
+  } finally {
+    inspectDb.close();
+    temp.cleanup();
+  }
+});

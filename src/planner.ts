@@ -1,4 +1,4 @@
-import type { LlmClient, LlmMessage } from "./llm.js";
+import { LlmRequestError, type LlmClient, type LlmMessage } from "./llm.js";
 import { getNumericRefinementInstruction } from "./request-shape.js";
 
 export type ReplyPlan = {
@@ -96,6 +96,15 @@ function parsePlanJson(rawText: string, userText: string): ReplyPlan {
   return fallbackPlan(userText);
 }
 
+function isPlannerTokenLimitError(error: unknown): boolean {
+  return error instanceof LlmRequestError &&
+    /\bmax[_ -]?tokens?\b|\bmodel output limit\b/i.test(error.message);
+}
+
+function getPlannerRetryBudget(maxOutputTokens: number): number {
+  return Math.max(maxOutputTokens * 2, 240);
+}
+
 export function buildPlannerMessages(
   userText: string,
   options: {
@@ -138,11 +147,25 @@ export async function createReplyPlan(
   } = {},
 ): Promise<{ plan: ReplyPlan; rawText: string; messages: LlmMessage[] }> {
   const messages = buildPlannerMessages(userText, options);
-  const result = await llmClient.generate({
-    messages,
-    maxOutputTokens,
-    responseFormat: "json_object",
-  });
+  let result;
+
+  try {
+    result = await llmClient.generate({
+      messages,
+      maxOutputTokens,
+      responseFormat: "json_object",
+    });
+  } catch (error) {
+    if (!isPlannerTokenLimitError(error)) {
+      throw error;
+    }
+
+    result = await llmClient.generate({
+      messages,
+      maxOutputTokens: getPlannerRetryBudget(maxOutputTokens),
+      responseFormat: "json_object",
+    });
+  }
 
   return {
     plan: parsePlanJson(result.text, userText),

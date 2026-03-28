@@ -6,7 +6,7 @@ import {
   createReplyPlan,
   isRecommendationRequest,
 } from "../src/planner.js";
-import type { LlmClient } from "../src/llm.js";
+import { LlmRequestError, type LlmClient } from "../src/llm.js";
 
 test("buildPlannerMessages keeps system instructions separate from user input", () => {
   const messages = buildPlannerMessages("what is the weather today?", {
@@ -120,6 +120,54 @@ test("createReplyPlan normalizes recommendation prompts into direct structured a
   assert.equal(result.plan.intent, "answer_question");
   assert.equal(result.plan.replyStyle, "structured");
   assert.equal(result.plan.mentionLimits, false);
+});
+
+test("createReplyPlan retries with a larger token budget when the planner hits the model output limit", async () => {
+  const seenBudgets: number[] = [];
+  const llmClient: LlmClient = {
+    async generate(request) {
+      seenBudgets.push(request.maxOutputTokens);
+
+      if (request.maxOutputTokens < 240) {
+        throw new LlmRequestError(
+          "OpenAI generate failed: Could not finish the message because max_tokens or model output limit was reached. Please try again with higher max_tokens.",
+        );
+      }
+
+      return {
+        model: "gpt-5-mini",
+        text: JSON.stringify({
+          intent: "answer_question",
+          objective: "Say hello back",
+          replyStyle: "concise",
+          mentionLimits: false,
+        }),
+      };
+    },
+    async *stream() {
+      yield {
+        type: "completed",
+        text: "",
+        model: "gpt-5-mini",
+      };
+    },
+    async embeddings() {
+      return {
+        model: "text-embedding-3-small",
+        vectors: [],
+      };
+    },
+  };
+
+  const result = await createReplyPlan(
+    llmClient,
+    "hi",
+    120,
+  );
+
+  assert.deepEqual(seenBudgets, [120, 240]);
+  assert.equal(result.plan.intent, "answer_question");
+  assert.equal(result.plan.replyStyle, "concise");
 });
 
 test("buildResponseMessages injects the plan into system instructions and keeps user text separate", () => {

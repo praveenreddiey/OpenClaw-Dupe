@@ -4,16 +4,30 @@ services:
     ports:
       - "3000:3000"
     environment:
+      TZ: "${TZ:-Asia/Calcutta}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       LLM_MODEL: "${LLM_MODEL:-gpt-5-mini}"
+      LLM_PLANNER_MAX_RESPONSE_TOKENS: "${LLM_PLANNER_MAX_RESPONSE_TOKENS:-240}"
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
       LIVE_LOOKUP_PROVIDER: "${LIVE_LOOKUP_PROVIDER:-openai_search}"
       LIVE_LOOKUP_MODEL: "${LIVE_LOOKUP_MODEL:-gpt-4o-mini-search-preview}"
+      SKILLS_ALLOWED_PATHS: "/app/clawallowed;/app/workspace"
+      SKILLS_BLOCKED_PATHS: "/app/workspace/.env;/app/workspace/config.yaml;/app/workspace/.git;/app/workspace/node_modules;/app/workspace/dist"
+      SKILLS_SHELL_ENABLED: "true"
+      SKILLS_TIMEOUT_MS: "15000"
+      SKILLS_SHELL_WORKING_DIRECTORY: "/app/workspace"
+      SKILLS_SHELL_ALLOWLIST: "git status --short;npm run lint;npm run build"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
+      - C:/Users/prave/Downloads/ClawAllowed:/app/clawallowed
+      - ./:/app/workspace
+      - workspace_node_modules:/app/workspace/node_modules
 
   tunnel:
     image: cloudflare/cloudflared:latest
     command: tunnel --url http://app:3000 --no-autoupdate
+
+volumes:
+  workspace_node_modules:
